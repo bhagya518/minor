@@ -153,6 +153,7 @@ class EpochManager:
         # Step 3: Run ML consensus on aggregated reports
         try:
             if self.ml_consensus_engine:
+                logger.info(f"Epoch {epoch_id}: ML CONSENSUS RUNNING...")
                 consensus_results = self.ml_consensus_engine.process_epoch_consensus(epoch_id, all_reports)
                 logger.info(f"Epoch {epoch_id}: ML consensus completed")
             else:
@@ -163,14 +164,23 @@ class EpochManager:
             logger.error(f"Epoch {epoch_id}: error in consensus: {e}")
             return
         
-        # Step 3: Quorum voting (2/3 majority)
-        malicious_votes = 0
-        honest_votes = 0
+        # Step 3: Reputation-weighted Quorum voting
+        weighted_malicious = 0.0
+        weighted_honest = 0.0
         node_verdicts = {}  # node_id -> verdict
+        node_weights = {}   # node_id -> reputation_weight
         
         for report in all_reports:
             node_id = report.get("node_address", report.get("node_id", "unknown"))
+            
+            # Get reputation weight for this node (default 0.5 if not known)
+            rep_weight = 0.5
+            if self.ml_consensus_engine and hasattr(self.ml_consensus_engine, 'reputation'):
+                rep_weight = self.ml_consensus_engine.reputation.get(node_id, 0.5)
+            node_weights[node_id] = rep_weight
+            
             # Get verdict from consensus results or simple heuristic
+            verdict = "honest"
             if consensus_results and "predictions" in consensus_results:
                 # Find prediction for this node
                 for pred in consensus_results["predictions"]:
@@ -179,10 +189,6 @@ class EpochManager:
                         p_malicious = pred.get("malicious_probability", pred.get("p_malicious", 0.5))
                         verdict = "malicious" if p_malicious >= 0.5 else "honest"
                         node_verdicts[node_id] = verdict
-                        if verdict == "malicious":
-                            malicious_votes += 1
-                        else:
-                            honest_votes += 1
                         break
             else:
                 # Fallback: simple heuristic based on report quality
@@ -190,20 +196,22 @@ class EpochManager:
                 ssl_valid = report.get("ssl_valid", True)
                 verdict = "honest" if (is_reachable and ssl_valid) else "malicious"
                 node_verdicts[node_id] = verdict
-                if verdict == "malicious":
-                    malicious_votes += 1
-                else:
-                    honest_votes += 1
+            
+            # Apply reputation weighting
+            if verdict == "malicious":
+                weighted_malicious += rep_weight
+            else:
+                weighted_honest += rep_weight
         
-        # Step 4: Check quorum - require strict majority with minimum 2 votes
-        total_votes = len(all_reports)
-        quorum = max(2, (total_votes * 2) // 3 + 1)
+        # Step 4: Check quorum - require weighted majority
+        total_weight = weighted_honest + weighted_malicious
+        quorum_threshold = total_weight * self.quorum_threshold  # 2/3 threshold
         
-        logger.info(f"Epoch {epoch_id}: voting results - honest: {honest_votes}, malicious: {malicious_votes}, quorum: {quorum}")
+        logger.info(f"Epoch {epoch_id}: weighted voting results - honest: {weighted_honest:.3f}, malicious: {weighted_malicious:.3f}, threshold: {quorum_threshold:.3f}")
         
-        # Step 5: Execute slashing if quorum reached for malicious
-        if malicious_votes >= quorum:
-            logger.warning(f"Epoch {epoch_id}: quorum reached for malicious ({malicious_votes}/{quorum}), executing slashing")
+        # Step 5: Execute slashing if weighted quorum reached for malicious
+        if weighted_malicious >= quorum_threshold:
+            logger.warning(f"Epoch {epoch_id}: weighted quorum reached for malicious ({weighted_malicious:.3f}/{quorum_threshold:.3f}), executing slashing")
             
             for report in all_reports:
                 node_id = report.get("node_address", report.get("node_id", "unknown"))
@@ -216,19 +224,19 @@ class EpochManager:
                             slash_result = await self.blockchain_client.slash_node(
                                 node_id, 
                                 amount=0.1,  # Slash 10% reputation
-                                reason=f"Epoch {epoch_id} consensus: {malicious_votes}/{total_votes} nodes voted malicious"
+                                reason=f"Epoch {epoch_id} consensus: weighted {weighted_malicious:.3f}/{total_weight:.3f} malicious"
                             )
                             logger.warning(f"Epoch {epoch_id}: SLASHED node {node_id} - {slash_result}")
                             self.slash_history.append({
                                 "epoch": epoch_id,
                                 "node_id": node_id,
-                                "reason": f"Consensus: {malicious_votes}/{total_votes} malicious votes",
+                                "reason": f"Consensus: weighted {weighted_malicious:.3f}/{total_weight:.3f} malicious",
                                 "timestamp": time.time()
                             })
                     except Exception as e:
                         logger.error(f"Epoch {epoch_id}: error slashing node {node_id}: {e}")
         else:
-            logger.info(f"Epoch {epoch_id}: no malicious quorum (need {quorum}, got {malicious_votes})")
+            logger.info(f"Epoch {epoch_id}: no malicious quorum (need {quorum_threshold:.3f}, got {weighted_malicious:.3f})")
         
         # Step 6: Update PoR for all nodes with penalty-based calculation
         for report in all_reports:
@@ -262,11 +270,13 @@ class EpochManager:
         
         # Step 7: Store epoch decision
         self.epoch_decisions[epoch_id] = {
-            "malicious_votes": malicious_votes,
-            "honest_votes": honest_votes,
-            "total_votes": total_votes,
-            "quorum_reached": malicious_votes >= quorum,
+            "weighted_malicious": weighted_malicious,
+            "weighted_honest": weighted_honest,
+            "total_weight": total_weight,
+            "quorum_threshold": quorum_threshold,
+            "quorum_reached": weighted_malicious >= quorum_threshold,
             "node_verdicts": node_verdicts,
+            "node_weights": node_weights,
             "consensus_results": consensus_results
         }
         
