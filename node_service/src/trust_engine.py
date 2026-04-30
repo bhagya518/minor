@@ -16,6 +16,10 @@ import statistics
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def clamp(x: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
+    """Clamp value to range [min_val, max_val]"""
+    return max(min_val, min(max_val, x))
+
 class TrustEngine:
     """Engine for calculating and managing node trust scores"""
     
@@ -142,7 +146,7 @@ class TrustEngine:
             decay_factor = self.trust_decay_rate ** (time_diff / 3600)  # Decay per hour
             
             final_score = trust_score * decay_factor
-            final_score = max(0.0, min(1.0, final_score))  # Clamp to [0,1]
+            final_score = clamp(final_score)  # Clamp to [0,1]
             
             # Update stored trust score
             self.node_trust_scores[node_id] = final_score
@@ -179,12 +183,47 @@ class TrustEngine:
             
             cv = std_time / mean_time
             # Convert to consistency score (lower CV = higher consistency)
-            consistency_score = max(0.0, 1.0 - cv)
+            # Use 1/(1+cv) to ensure score is always between 0 and 1
+            consistency_score = 1.0 / (1.0 + cv)
             
             return consistency_score
             
         except statistics.StatisticsError:
             return 0.5  # Neutral score on error
+    
+    def _detect_outliers(self, response_times: List[float]) -> int:
+        """
+        Detect outliers in response times using median absolute deviation
+        
+        Args:
+            response_times: List of response times
+            
+        Returns:
+            Number of outliers detected
+        """
+        if len(response_times) < 3:
+            return 0
+        
+        try:
+            # Calculate median
+            median = statistics.median(response_times)
+            
+            # Calculate absolute deviations
+            deviations = [abs(rt - median) for rt in response_times]
+            mad = statistics.median(deviations)  # Median Absolute Deviation
+            
+            if mad == 0:
+                return 0
+            
+            # Threshold: 3 MADs (common statistical threshold)
+            threshold = 3 * mad
+            outliers = sum(1 for rt in response_times if abs(rt - median) > threshold)
+            
+            return outliers
+            
+        except Exception as e:
+            logger.error(f"Error detecting outliers: {e}")
+            return 0
     
     def _calculate_content_consistency(self, node_id: str) -> float:
         """Calculate content consistency with peer nodes"""

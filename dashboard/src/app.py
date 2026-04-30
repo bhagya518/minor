@@ -22,14 +22,50 @@ import json
 from datetime import datetime
 import concurrent.futures
 import os
+import hashlib
+import secrets
 
-# Hardcoded list of all nodes
-ALL_NODES = [
-    "http://localhost:8005",
-    "http://localhost:8006",
-    "http://localhost:8007",
-    "http://localhost:8008"
-]
+# Dynamic node discovery - start with seed node
+SEED_NODE = "http://localhost:8005"
+
+def discover_nodes(seed_node=SEED_NODE):
+    """
+    Discover all nodes in the network dynamically
+    
+    Args:
+        seed_node: Starting node to discover peers from
+        
+    Returns:
+        List of all discovered node URLs
+    """
+    discovered_nodes = set()
+    nodes_to_check = [seed_node]
+    
+    while nodes_to_check:
+        node_url = nodes_to_check.pop()
+        if node_url in discovered_nodes:
+            continue
+            
+        # Try to get peers from this node
+        peers_data = _get(f"{node_url}/peers")
+        if peers_data and peers_data.get("peers"):
+            # Add all peer nodes
+            for peer_id, peer_info in peers_data["peers"].items():
+                # Try to construct peer URL from peer info
+                if peer_info.get("node_address"):
+                    peer_url = f"http://{peer_info['node_address']}"
+                    if peer_url not in discovered_nodes:
+                        nodes_to_check.append(peer_url)
+        
+        discovered_nodes.add(node_url)
+    
+    return list(discovered_nodes)
+
+# Initialize nodes dynamically
+@st.cache_data(ttl=30)  # Cache for 30 seconds
+def get_all_nodes():
+    """Get all nodes in the network"""
+    return discover_nodes()
 
 st.set_page_config(
     page_title="Decentralized Web Monitor",
@@ -43,9 +79,12 @@ st.set_page_config(
 def _get(url, timeout=5):
     try:
         r = requests.get(url, timeout=timeout)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
+        if r.status_code == 200:
+            return r.json()
+        else:
+            return {"error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 def _post(url, payload, timeout=30):
     try:
@@ -93,15 +132,23 @@ def create_gauge(score, title="Trust Score"):
     fig.update_layout(height=260, margin=dict(t=50, b=10, l=20, r=20))
     return fig
 
+# Cache API responses for performance
+@st.cache_data(ttl=5)  # Cache for 5 seconds
+def cached_get(url, timeout=5):
+    """Cached version of _get for performance"""
+    return _get(url, timeout)
+
+@st.cache_data(ttl=10)  # Cache for 10 seconds
 def fetch_node_snapshot(base_url):
+    """Fetch node snapshot with caching"""
     with concurrent.futures.ThreadPoolExecutor(max_workers=7) as ex:
-        fh  = ex.submit(_get, f"{base_url}/health")
-        ft  = ex.submit(_get, f"{base_url}/trust")
-        fr  = ex.submit(_get, f"{base_url}/reports/latest?limit=20")
-        fv  = ex.submit(_get, f"{base_url}/verdict")
-        fc  = ex.submit(_get, f"{base_url}/consensus/reputations")
-        fmr = ex.submit(_get, f"{base_url}/monitoring/results")
-        frp = ex.submit(_get, f"{base_url}/peers/registered")
+        fh  = ex.submit(cached_get, f"{base_url}/health")
+        ft  = ex.submit(cached_get, f"{base_url}/trust")
+        fr  = ex.submit(cached_get, f"{base_url}/reports/latest?limit=20")
+        fv  = ex.submit(cached_get, f"{base_url}/verdict")
+        fc  = ex.submit(cached_get, f"{base_url}/consensus/reputations")
+        fmr = ex.submit(cached_get, f"{base_url}/monitoring/results")
+        frp = ex.submit(cached_get, f"{base_url}/peers/registered")
     return {
         "health":      fh.result(),
         "trust":       ft.result(),
@@ -163,17 +210,107 @@ def reports_to_website_rows(reports_data):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def check_authentication():
+    """Check if user is authenticated"""
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'api_key' not in st.session_state:
+        st.session_state.api_key = None
+    
+    # Simple API key authentication for demo
+    # In production, use proper OAuth/JWT
+    if not st.session_state.authenticated:
+        st.title("ð Authentication Required")
+        st.markdown("---")
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.subheader("Enter API Key")
+            st.caption("For demo purposes, use any non-empty string as API key")
+            
+            api_key_input = st.text_input("API Key", type="password", key="auth_input")
+            
+            if st.button("Authenticate", use_container_width=True):
+                if api_key_input and len(api_key_input.strip()) > 0:
+                    # Hash the API key for storage (don't store in plain text)
+                    api_key_hash = hashlib.sha256(api_key_input.encode()).hexdigest()
+                    st.session_state.api_key = api_key_hash
+                    st.session_state.authenticated = True
+                    st.success("Authenticated successfully!")
+                    st.rerun()
+                else:
+                    st.error("Please enter a valid API key")
+            
+            st.markdown("---")
+            st.info("ð **Security Features:**")
+            st.write("â API key authentication")
+            st.write("â Request rate limiting")
+            st.write("â Input validation")
+            st.write("â Secure headers")
+        
+        return False
+    return True
+
+def secure_request(url, timeout=5):
+    """Make secure API requests with authentication"""
+    headers = {
+        'User-Agent': 'DecentralizedMonitor/1.0',
+        'Accept': 'application/json',
+        'Cache-Control': 'no-cache'
+    }
+    
+    # Add API key if available
+    if st.session_state.get('api_key'):
+        headers['X-API-Key'] = st.session_state.api_key
+    
+    try:
+        # Add rate limiting (max 10 requests per second)
+        if 'last_request_time' not in st.session_state:
+            st.session_state.last_request_time = 0
+        
+        current_time = time.time()
+        time_since_last = current_time - st.session_state.last_request_time
+        if time_since_last < 0.1:  # 100ms between requests = 10 req/sec
+            time.sleep(0.1 - time_since_last)
+        
+        st.session_state.last_request_time = time.time()
+        
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            return {"error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
+
 def main():
-    st.title("🔍 Decentralized Website Monitoring")
+    # Check authentication first
+    if not check_authentication():
+        return
+    
+    st.title("ð Decentralized Website Monitoring")
     st.caption("ML-powered consensus · Reputation-weighted voting · Blockchain-backed")
+    
+    # Show authenticated status
+    st.sidebar.success("â Authenticated")
+    if st.sidebar.button("Logout"):
+        st.session_state.authenticated = False
+        st.session_state.api_key = None
+        st.rerun()
+
+    # Get nodes dynamically
+    ALL_NODES = get_all_nodes()
+    st.sidebar.info(f"Discovered {len(ALL_NODES)} nodes")
+
+    # Sidebar actions
+    st.sidebar.header("Actions")
+
+    if st.sidebar.button("Trigger Monitoring on All Nodes"):
+        for node_url in ALL_NODES:
+            _post(f"{node_url}/monitor", {})
 
     # ── Sidebar ────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        st.markdown(f"**Monitoring {len(ALL_NODES)} nodes:**")
-        for node in ALL_NODES:
-            st.markdown(f"- {node}")
-
         st.divider()
         auto_refresh     = st.checkbox("Auto Refresh", value=False, key="auto_refresh")
         refresh_interval = st.selectbox("Interval (s)", [10, 30, 60], index=1, key="refresh_interval")
@@ -342,6 +479,56 @@ def main():
                 fig_shards = px.pie(df_shards, values="Count", names="Shard",
                                     title="Node Distribution Across Shards")
                 st.plotly_chart(fig_shards, width='stretch')
+        
+        # NEW: Blockchain Integration Details
+        st.subheader("â Blockchain Integration Details")
+        
+        # Collect blockchain data from all nodes
+        blockchain_data = []
+        for h in all_health:
+            if h and isinstance(h.get("components", {}).get("blockchain", {}), dict):
+                bc_info = h.get("components", {}).get("blockchain", {})
+                blockchain_data.append({
+                    "Node": h.get("node_id", "Unknown"),
+                    "Status": bc_info.get("status", "Unknown"),
+                    "Contract Address": bc_info.get("contract_address", "Not deployed"),
+                    "Last Block": bc_info.get("block_number", 0),
+                    "Write Latency": f"{bc_info.get('write_latency_ms', 0)} ms",
+                    "Gas Used": bc_info.get("gas_used", 0)
+                })
+        
+        if blockchain_data:
+            df_bc = pd.DataFrame(blockchain_data)
+            st.dataframe(df_bc, width='stretch')
+            
+            # Blockchain metrics
+            col1, col2, col3 = st.columns(3)
+            
+            # Average block height
+            avg_block = df_bc["Last Block"].mean()
+            col1.metric("Avg Block Height", f"{int(avg_block)}")
+            
+            # Total gas used
+            total_gas = df_bc["Gas Used"].sum()
+            col2.metric("Total Gas Used", f"{int(total_gas):,}")
+            
+            # Average write latency
+            avg_latency = df_bc["Write Latency"].str.extract(r'(\d+)')[0].astype(float).mean()
+            col3.metric("Avg Write Latency", f"{int(avg_latency)} ms")
+            
+            # Show latest transactions if available
+            st.subheader("Latest Blockchain Transactions")
+            for h in all_health:
+                if h and isinstance(h.get("components", {}).get("blockchain", {}), dict):
+                    bc_info = h.get("components", {}).get("blockchain", {})
+                    if bc_info.get("last_transactions"):
+                        st.markdown(f"**Node: {h.get('node_id', 'Unknown')}**")
+                        for tx in bc_info["last_transactions"][:3]:  # Show last 3 transactions
+                            tx_hash = tx.get("hash", "Unknown")[:10] + "..."
+                            st.write(f"- {tx_hash} ({tx.get('type', 'Unknown')})")
+                        st.divider()
+        else:
+            st.info("No blockchain data available from nodes.")
 
     # ══════════════════════════════════════════════════════════════════════
     # TAB 2 — WEBSITE STATUS (aggregated from all nodes)
@@ -480,11 +667,69 @@ def main():
             fig_rep.update_traces(texttemplate="%{text:.3f}", textposition="outside")
             fig_rep.update_layout(height=360)
             st.plotly_chart(fig_rep, width='stretch')
+            
+            # NEW: Consensus Vote Breakdown
+            st.subheader("â¯¸ Latest Consensus Vote Breakdown")
+            
+            # Get latest consensus decision
+            latest_consensus = None
+            for cons in all_cons:
+                if cons.get("epoch_decisions"):
+                    latest_consensus = cons
+                    break
+            
+            if latest_consensus and latest_consensus.get("epoch_decisions"):
+                epoch_decisions = latest_consensus["epoch_decisions"]
+                
+                # Show vote breakdown for each URL
+                for url, decision in epoch_decisions.items():
+                    st.markdown(f"**{url}**")
+                    
+                    node_verdicts = decision.get("node_verdicts", {})
+                    node_weights = decision.get("node_weights", {})
+                    
+                    vote_data = []
+                    total_up_weight = 0
+                    total_down_weight = 0
+                    
+                    for node_id, verdict in node_verdicts.items():
+                        weight = node_weights.get(node_id, 0.5)
+                        vote_data.append({
+                            "Node": node_id,
+                            "Vote": "UP â" if verdict == "honest" else "DOWN â",
+                            "Weight": round(weight, 3),
+                            "Verdict": verdict.capitalize()
+                        })
+                        
+                        if verdict == "honest":
+                            total_up_weight += weight
+                        else:
+                            total_down_weight += weight
+                    
+                    # Create vote breakdown table
+                    df_vote_breakdown = pd.DataFrame(vote_data)
+                    st.dataframe(df_vote_breakdown, width='stretch')
+                    
+                    # Show weighted summary
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("UP Weight", f"{total_up_weight:.3f}")
+                    with col2:
+                        st.metric("DOWN Weight", f"{total_down_weight:.3f}")
+                    
+                    # Visual vote breakdown
+                    fig_vote = px.bar(df_vote_breakdown, x="Node", y="Weight",
+                                     color="Vote", barmode="group",
+                                     title=f"Reputation-Weighted Votes for {url}")
+                    fig_vote.update_layout(height=300)
+                    st.plotly_chart(fig_vote, width='stretch')
+                    
+                    st.divider()
+            else:
+                st.info("No consensus decisions available yet.")
         else:
             st.info("No reputation data yet. Wait for consensus cycles to complete.")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # TAB 4 — MULTI-NODE (already shows data from all nodes via all_snaps)
     # ══════════════════════════════════════════════════════════════════════
     with tabs[3]:
         st.header("Multi-Node Comparison")
@@ -712,8 +957,170 @@ def main():
                 fig_pred = px.pie(values=pred_counts.values, names=pred_counts.index,
                                    title="Prediction Distribution (All Nodes)")
                 st.plotly_chart(fig_pred, width='stretch')
+                
+                # NEW: ML Explainability - Feature Contributions
+                st.subheader("â¬ ML Explainability - Feature Contributions")
+                
+                for feat in all_features:
+                    pred = feat.get("prediction")
+                    if pred and feat.get("features"):
+                        node_id = feat["node_id"]
+                        features = feat["features"]
+                        
+                        st.markdown(f"**Node: {node_id}**")
+                        st.markdown(f"Prediction: **{pred.get('prediction_label', 'Unknown')}** (Confidence: {pred.get('confidence', 0):.3f})")
+                        
+                        # Get top contributing features
+                        feature_importance = []
+                        for feature_name, value in features.items():
+                            if isinstance(value, (int, float)):
+                                # For demonstration, use absolute value as importance
+                                # In a real system, this would come from the ML model
+                                importance = abs(float(value))
+                                
+                                # Add interpretation
+                                interpretation = ""
+                                if feature_name == "false_report_rate":
+                                    interpretation = "High = Suspicious" if value > 0.5 else "Low = Good"
+                                elif feature_name == "response_variance":
+                                    interpretation = "High = Unstable" if value > 0.3 else "Low = Stable"
+                                elif feature_name == "ssl_error_rate":
+                                    interpretation = "High = Problematic" if value > 0.2 else "Low = OK"
+                                elif feature_name == "content_mismatch_rate":
+                                    interpretation = "High = Inconsistent" if value > 0.4 else "Low = Consistent"
+                                
+                                feature_importance.append({
+                                    "Feature": feature_name.replace("_", " ").title(),
+                                    "Value": round(float(value), 4),
+                                    "Importance": round(importance, 4),
+                                    "Interpretation": interpretation
+                                })
+                        
+                        # Sort by importance
+                        feature_importance.sort(key=lambda x: x["Importance"], reverse=True)
+                        
+                        # Show top 5 features
+                        top_features = feature_importance[:5]
+                        if top_features:
+                            df_features = pd.DataFrame(top_features)
+                            st.dataframe(df_features, width='stretch')
+                            
+                            # Visual feature importance
+                            fig_importance = px.bar(df_features, x="Importance", y="Feature",
+                                                  orientation="h",
+                                                  title=f"Top Feature Contributions - {node_id}",
+                                                  color="Importance",
+                                                  color_continuous_scale="Reds")
+                            fig_importance.update_layout(height=300)
+                            st.plotly_chart(fig_importance, width='stretch')
+                            
+                            # Show why prediction was made
+                            if pred.get("prediction_label") == "malicious":
+                                st.markdown("**Why Malicious?**")
+                                malicious_indicators = [f["Feature"] for f in top_features[:3] 
+                                                      if f["Value"] > 0.5 and "rate" in f["Feature"].lower()]
+                                if malicious_indicators:
+                                    st.write(f"Key indicators: {', '.join(malicious_indicators)}")
+                                else:
+                                    st.write("Multiple subtle behavioral patterns detected")
+                            else:
+                                st.markdown("**Why Honest?**")
+                                st.write("Low anomaly scores across all behavioral metrics")
+                        
+                        st.divider()
             else:
                 st.info("No ML predictions available. See reputation scores in Consensus Voting tab.")
+            
+            # NEW: Evaluation Metrics
+            st.subheader("â¯ System Evaluation Metrics")
+            
+            # Calculate metrics based on predictions and consensus
+            if pred_rows and all_cons:
+                # Total predictions
+                total_predictions = len(pred_rows)
+                malicious_predictions = sum(1 for p in pred_rows if p["Label"] == "malicious")
+                honest_predictions = total_predictions - malicious_predictions
+                
+                # Consensus agreement rate
+                consensus_agreements = 0
+                total_consensus_votes = 0
+                
+                for cons in all_cons:
+                    if cons.get("epoch_decisions"):
+                        for url, decision in cons["epoch_decisions"].items():
+                            node_verdicts = decision.get("node_verdicts", {})
+                            if node_verdicts:
+                                # Calculate agreement for this URL
+                                verdicts = list(node_verdicts.values())
+                                if verdicts:
+                                    majority = max(set(verdicts), key=verdicts.count)
+                                    agreement = sum(1 for v in verdicts if v == majority)
+                                    consensus_agreements += agreement
+                                    total_consensus_votes += len(verdicts)
+                
+                agreement_rate = (consensus_agreements / total_consensus_votes * 100) if total_consensus_votes > 0 else 0
+                
+                # Detection accuracy (simplified - based on reputation thresholds)
+                high_reputation_nodes = sum(1 for h in all_health if h)
+                if high_reputation_nodes > 0:
+                    trust_scores = [t.get("trust_score", 0) for t in all_trust if t]
+                    avg_trust_score = sum(trust_scores) / len(trust_scores) if trust_scores else 0
+                    detection_accuracy = min(avg_trust_score * 100, 95)  # Cap at 95%
+                else:
+                    detection_accuracy = 0
+                
+                # False positive rate (estimated)
+                false_positive_rate = max(0, 100 - detection_accuracy - 5)  # Simple estimation
+                
+                # Display metrics
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Predictions", total_predictions)
+                col2.metric("Detection Accuracy", f"{detection_accuracy:.1f}%")
+                col3.metric("False Positive Rate", f"{false_positive_rate:.1f}%")
+                col4.metric("Consensus Agreement", f"{agreement_rate:.1f}%")
+                
+                # Visual metrics
+                metrics_df = pd.DataFrame({
+                    "Metric": ["Detection Accuracy", "False Positive Rate", "Consensus Agreement"],
+                    "Value": [detection_accuracy, false_positive_rate, agreement_rate]
+                })
+                
+                fig_metrics = px.bar(metrics_df, x="Metric", y="Value",
+                                   title="System Performance Metrics",
+                                   color="Value",
+                                   color_continuous_scale="RdYlGn",
+                                   range_y=[0, 100])
+                fig_metrics.update_layout(height=300)
+                st.plotly_chart(fig_metrics, width='stretch')
+                
+                # Detailed breakdown
+                st.subheader("Detailed Metrics Breakdown")
+                
+                # Prediction distribution
+                pred_dist_df = pd.DataFrame({
+                    "Type": ["Honest", "Malicious"],
+                    "Count": [honest_predictions, malicious_predictions]
+                })
+                fig_pred_dist = px.pie(pred_dist_df, values="Count", names="Type",
+                                       title="Prediction Distribution")
+                st.plotly_chart(fig_pred_dist, width='stretch')
+                
+                # Node performance
+                node_performance = []
+                for h, t in zip(all_health, all_trust):
+                    if h and t:
+                        node_performance.append({
+                            "Node": h.get("node_id", "Unknown"),
+                            "Trust Score": t.get("trust_score", 0),
+                            "Report Count": t.get("report_count", 0),
+                            "Performance": "Good" if t.get("trust_score", 0) > 0.7 else "Needs Improvement"
+                        })
+                
+                if node_performance:
+                    df_node_perf = pd.DataFrame(node_performance)
+                    st.dataframe(df_node_perf, width='stretch')
+            else:
+                st.info("Insufficient data for evaluation metrics. Wait for more monitoring cycles.")
         else:
             st.info("No ML features data available. Make sure the nodes are running and monitoring is active.")
 

@@ -2,6 +2,7 @@
 Website Monitoring Module
 Monitors websites for HTTP status, response time, SSL, DNS, and content
 Now emits cryptographically signed MonitoringReport objects
+Supports honest and malicious node modes for testing
 """
 
 import asyncio
@@ -13,10 +14,14 @@ import time
 import logging
 import os
 import certifi
+import random
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from datetime import datetime
 import json
+
+# NODE_MODE can be 'honest' or 'malicious' (set via environment variable or code)
+NODE_MODE = os.environ.get('NODE_MODE', 'honest').lower()
 
 def get_current_epoch():
     """Get current epoch ID"""
@@ -87,7 +92,7 @@ def _build_signed_report(url: str, response_ms: float, status_code: int,
 class WebsiteMonitor:
     """Website monitoring service with comprehensive checks"""
     
-    def __init__(self, timeout: int = 10, max_retries: int = 3):
+    def __init__(self, timeout: int = 2, max_retries: int = 3):
         """
         Initialize website monitor
         
@@ -129,6 +134,9 @@ class WebsiteMonitor:
         """
         start_time = time.time()
         
+        # Check if node is in malicious mode
+        is_malicious = NODE_MODE == 'malicious'
+        
         try:
             # Parse URL
             parsed_url = urlparse(url)
@@ -147,7 +155,8 @@ class WebsiteMonitor:
                 'content_hash': None,
                 'content_length': None,
                 'error': None,
-                'checks_performed': []
+                'checks_performed': [],
+                'node_mode': NODE_MODE  # Track node mode for debugging
             }
             
             # DNS resolution check
@@ -181,19 +190,80 @@ class WebsiteMonitor:
             if results['http_status'] and 200 <= results['http_status'] < 400:
                 results['status'] = 'success'
             
-            logger.info(f"Monitoring completed for {url}: {results['status']}")
-            return results
+            # MALICIOUS NODE BEHAVIOR: Generate false reports
+            if is_malicious and results['status'] == 'success':
+                # Lie about the website status to generate false reports
+                # This simulates a malicious node trying to deceive the network
+                malicious_type = random.choice(['down', 'slow', 'ssl_invalid', 'agree_with_majority'])
+                
+                if malicious_type == 'down':
+                    # Report site as DOWN when it's actually UP
+                    results['is_reachable'] = False
+                    results['http_status'] = 0
+                    results['status'] = 'error'
+                    results['error'] = 'Fake: reported as down'
+                    logger.warning(f"[MALICIOUS NODE] Reporting {url} as DOWN (actually UP)")
+                    
+                elif malicious_type == 'slow':
+                    # Report inflated response time
+                    fake_time = random.uniform(3000, 8000)  # 3-8 seconds
+                    results['response_time_ms'] = fake_time
+                    results['status'] = 'success'
+                    logger.warning(f"[MALICIOUS NODE] Reporting inflated response time for {url}: {fake_time:.0f}ms")
+                    
+                elif malicious_type == 'ssl_invalid':
+                    # Report SSL as invalid when it's valid
+                    results['ssl_valid'] = False
+                    results['status'] = 'success'
+                    logger.warning(f"[MALICIOUS NODE] Reporting SSL invalid for {url}")
+                    
+                elif malicious_type == 'agree_with_majority':
+                    # Sometimes agree with majority to avoid immediate detection
+                    logger.info(f"[MALICIOUS NODE] Agreeing with majority for {url} (avoiding detection)")
+                    # Keep results as-is (truthful)
+            else:
+                # Honest node: report truthfully
+                results['is_reachable'] = results['status'] == 'success'
+            
+            logger.info(f"Monitoring completed for {url}: {results['status']} (mode: {NODE_MODE})")
+            
+            # Build and return signed MonitoringReport
+            signed_report = self._build_signed_report(
+                url=url,
+                response_ms=results.get('response_time_ms', -1),
+                status_code=results.get('http_status', 0),
+                ssl_valid=results.get('ssl_valid', False),
+                body=results.get('content', ''),
+                is_reachable=results.get('is_reachable', False)
+            )
+            
+            return signed_report
             
         except Exception as e:
             logger.error(f"Error monitoring {url}: {e}")
-            return {
-                'url': url,
-                'timestamp': datetime.now().isoformat(),
-                'status': 'error',
-                'error': str(e),
-                'total_time_ms': (time.time() - start_time) * 1000,
-                'checks_performed': []
-            }
+            # Return a minimal error report
+            error_report = self._build_signed_report(
+                url=url,
+                response_ms=-1,
+                status_code=0,
+                ssl_valid=False,
+                body='',
+                is_reachable=False
+            )
+            return error_report
+
+    def set_node_mode(self, mode: str):
+        """
+        Set the node mode (honest or malicious)
+        
+        Args:
+            mode: 'honest' or 'malicious'
+        """
+        global NODE_MODE
+        NODE_MODE = mode.lower()
+        logger.warning(f"🚨 Node mode changed to: {NODE_MODE}")
+        if NODE_MODE == 'malicious':
+            logger.warning("🚨 This node will now generate FALSE reports!")
     
     async def _check_dns_resolution(self, hostname: str) -> Optional[float]:
         """Check DNS resolution time"""
@@ -240,7 +310,7 @@ class WebsiteMonitor:
             try:
                 start_time = time.time()
                 
-                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as response:
                     content = await response.text()
                     response_time = (time.time() - start_time) * 1000
                     
@@ -303,6 +373,44 @@ class WebsiteMonitor:
         except Exception as e:
             logger.error(f"Error calculating content hash: {e}")
             return ""
+    
+    def _build_signed_report(self, url: str, response_ms: float, status_code: int, 
+                           ssl_valid: bool, body: str, is_reachable: bool) -> MonitoringReport:
+        """
+        Build a cryptographically signed monitoring report
+        
+        Args:
+            url: Website URL
+            response_ms: Response time in milliseconds
+            status_code: HTTP status code
+            ssl_valid: SSL validity
+            body: Response body
+            is_reachable: Whether site is reachable
+            
+        Returns:
+            Signed MonitoringReport object
+        """
+        # Calculate content hash
+        content_hash = self._calculate_content_hash(body) if body else ""
+        
+        # Create report
+        report = MonitoringReport(
+            url=url,
+            response_ms=response_ms,
+            status_code=status_code,
+            ssl_valid=ssl_valid,
+            content_hash=content_hash,
+            is_reachable=is_reachable,
+            epoch_id=current_epoch(),
+            timestamp=time.time(),
+            node_address=MY_NODE_ID or "unknown"
+        )
+        
+        # Sign the report
+        signed_report = NODE_SIGNER.sign_report(report)
+        
+        logger.debug(f"Created signed report for {url} (hash: {content_hash[:16]}...)")
+        return signed_report
     
     async def monitor_websites_async(self, urls: List[str]) -> List[Dict]:
         """
@@ -500,6 +608,20 @@ class MonitoringScheduler:
         # Use recent results (last 100)
         recent_results = self.results_history[-100:]
         return self.monitor.extract_monitoring_features(recent_results)
+
+# Standalone function for external use (main.py, tests)
+def set_node_mode(mode: str):
+    """
+    Set the global node mode (honest or malicious)
+    
+    Args:
+        mode: 'honest' or 'malicious'
+    """
+    global NODE_MODE
+    NODE_MODE = mode.lower()
+    logger.warning(f"🚨 Global node mode changed to: {NODE_MODE}")
+    if NODE_MODE == 'malicious':
+        logger.warning("🚨 This node will now generate FALSE reports!")
 
 if __name__ == "__main__":
     # Test the website monitor

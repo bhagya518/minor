@@ -65,7 +65,7 @@ except ImportError as e:
 
 # Import monitoring components
 try:
-    from website_monitor import WebsiteMonitor, MonitoringScheduler, set_node_id, NODE_SIGNER
+    from website_monitor import WebsiteMonitor, MonitoringScheduler, set_node_id, set_node_mode, NODE_SIGNER
     from trust_engine import TrustEngine, TrustCalculator
     from peer_client import PeerClient
     from src.epoch_manager import init_epoch_manager, get_epoch_manager
@@ -203,9 +203,18 @@ async def startup_event():
         
         logger.info(f"Node configuration: {node_config.node_id} on {node_config.host}:{node_config.port}")
         
-        # Initialize website_monitor module with proper node ID
+        # Initialize website_monitor module with proper node ID and mode
         if monitoring_available:
             set_node_id(node_config.node_id)
+            
+            # Set node mode (honest or malicious) from environment variable
+            import os
+            node_mode = os.environ.get('NODE_MODE', 'honest').lower()
+            if node_mode in ['honest', 'malicious']:
+                set_node_mode(node_mode)
+                logger.warning(f"🚨 Node mode set to: {node_mode.upper()}")
+                if node_mode == 'malicious':
+                    logger.warning("🚨 This node will generate FALSE reports for testing!")
         
         # Initialize components
         website_monitor = WebsiteMonitor()
@@ -215,6 +224,11 @@ async def startup_event():
         p2p_port = node_config.port + 1000
         peer_client = PeerClient(node_config.node_id, node_config.host, p2p_port)
         await peer_client.start_server()
+        
+        # Set node signer for P2P message authentication
+        if monitoring_available:
+            peer_client.set_node_signer(NODE_SIGNER)
+            logger.info("Node signer configured for P2P message authentication")
         
         # Initialize enhanced ML integration
         try:

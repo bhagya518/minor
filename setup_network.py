@@ -12,11 +12,18 @@ import time
 import json
 from itertools import permutations
 
+import os
+import sys
+
 NODES = {
     "node_a":    "http://localhost:8005",
     "node_b":    "http://localhost:8006",
     "node_c":    "http://localhost:8007",
-    "node_d": "http://localhost:8008",
+    "node_d":    "http://localhost:8008",
+    "node_e":    "http://localhost:8009",
+    "node_f":    "http://localhost:8010",
+    "node_g":    "http://localhost:8011",
+    "node_h":    "http://localhost:8012",
 }
 
 MONITORED_URL = "https://httpbin.org/get"
@@ -57,6 +64,10 @@ for (src_id, src_url), (dst_id, dst_url) in permutations(NODES.items(), 2):
 print("\n[OK] Full mesh registered. Waiting 5s for nodes to sync...")
 time.sleep(5)
 
+# Load signing utilities (same code used by nodes)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'node_service', 'src'))
+from monitoring_report import MonitoringReport, NodeSigner
+
 # ── Step 3: verify mesh ───────────────────────────────────────────────────────
 print("\n=== STEP 3: Verifying peer registration ===")
 for node_id, base_url in NODES.items():
@@ -87,18 +98,32 @@ for round_num in range(1, 4):
     print(f"--- Round {round_num} (epoch {epoch}) ---")
 
     for port in honest_ports:
+        # Create a real signed MonitoringReport (Ed25519)
+        signer = NodeSigner(private_key_hex=None)
+        report = MonitoringReport(
+            url=MONITORED_URL,
+            epoch_id=epoch,
+            response_ms=9999.0,
+            status_code=0,
+            ssl_valid=False,
+            content_hash="000000000000",
+            is_reachable=False,
+            node_address="node_d",
+            timestamp=time.time(),
+        )
+        signed = signer.sign_report(report)
         payload = {
-            "node_address": "node_d",
-            "url":          MONITORED_URL,
-            "is_reachable": False,        # LIE: says site is DOWN
-            "status_code":  0,
-            "response_ms":  9999.0,
-            "ssl_valid":    False,
-            "timestamp":    time.time(),
-            "epoch_id":     epoch,
-            "signature":    pubkeys["node_d"],   # real pubkey as sig token
-            "report_hash":  f"malicious_{round_num}_{port}",
-            "content_hash": "000000000000",
+            "node_address": signed.node_address,
+            "url": signed.url,
+            "is_reachable": signed.is_reachable,
+            "status_code": signed.status_code,
+            "response_ms": signed.response_ms,
+            "ssl_valid": signed.ssl_valid,
+            "timestamp": signed.timestamp,
+            "epoch_id": signed.epoch_id,
+            "signature": signed.signature,
+            "report_hash": signed.report_hash,
+            "content_hash": signed.content_hash,
         }
         try:
             r = requests.post(f"http://localhost:{port}/report",

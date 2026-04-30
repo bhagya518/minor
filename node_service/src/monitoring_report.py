@@ -48,8 +48,12 @@ class MonitoringReport:
     timestamp: float = field(default_factory=time.time)
     
     # Filled after signing
-    report_hash: str = ""   # SHA-256 of the canonical payload
-    signature: str = ""     # Ed25519 hex signature of report_hash
+    report_hash: str = field(init=False, default="")   # SHA-256 of the canonical payload
+    signature: str = field(init=False, default="")     # Ed25519 hex signature of report_hash
+    public_key: str = field(init=False, default="")    # Public key of the node
+    
+    # Version for compatibility
+    version: int = 1
     
     def canonical_payload(self) -> bytes:
         """
@@ -59,15 +63,16 @@ class MonitoringReport:
         payload = {
             "url": self.url,
             "epoch_id": self.epoch_id,
-            "response_ms": round(self.response_ms, 2),
+            "response_ms": float(f"{self.response_ms:.2f}"),  # Precise 2 decimal places
             "status_code": self.status_code,
             "ssl_valid": self.ssl_valid,
             "content_hash": self.content_hash,
             "is_reachable": self.is_reachable,
+            "timestamp": int(self.timestamp * 1000),  # Milliseconds for consistency
             "node_address": self.node_address,
-            "timestamp": round(self.timestamp, 3),
+            "version": self.version
         }
-        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
     
     def compute_hash(self) -> str:
         """Compute SHA-256 hash of canonical payload"""
@@ -101,18 +106,17 @@ class NodeSigner:
         return self._public.public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
     
     def sign_report(self, report: MonitoringReport) -> MonitoringReport:
-        """
-        Fills report_hash and signature in-place, returns the report.
-        
-        Args:
-            report: Unsigned monitoring report
-            
-        Returns:
-            The same report object with report_hash and signature filled
-        """
+        """Sign a monitoring report and return the signed version"""
+        # Compute hash
         report.report_hash = report.compute_hash()
-        sig_bytes = self._private.sign(bytes.fromhex(report.report_hash))
-        report.signature = sig_bytes.hex()
+        
+        # Sign the hash
+        signature_bytes = self._private.sign(bytes.fromhex(report.report_hash))
+        report.signature = signature_bytes.hex()
+        
+        # Include public key for self-contained verification
+        report.public_key = self.public_key_hex
+        
         return report
     
     def export_private_key_hex(self) -> str:
@@ -158,6 +162,16 @@ class ReportVerifier:
             
         except Exception:
             return False
+    
+    def is_valid(self) -> bool:
+        """Validate report fields"""
+        return (
+            self.url != "" and
+            self.node_address != "" and
+            self.epoch_id >= 0 and
+            self.response_ms >= 0 and
+            self.status_code >= 0
+        )
     
     @staticmethod
     def to_dict(report: MonitoringReport) -> dict:

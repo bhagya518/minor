@@ -1,0 +1,558 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title EthereumMonitoring
+ * @dev Ethereum-native high-performance monitoring system
+ * Optimized for Ethereum L1 + L2 integration with gas efficiency
+ * Implements EIP-1559, batch processing, and cross-layer communication
+ */
+contract EthereumMonitoring is ReentrancyGuard, Ownable, Pausable {
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    // ===== CONSTANTS =====
+    
+    uint256 public constant EPOCH_DURATION = 600; // 10 minutes
+    uint256 public constant BATCH_SIZE = 1000;
+    uint256 public constant MIN_STAKE_ETH = 1 ether; // 1 ETH minimum
+    uint256 public constant MIN_STAKE_MON = 1000 * 10**18; // 1000 MON tokens
+    uint256 public constant SLASH_PERCENTAGE = 500; // 50% slash
+    uint256 public constant REWARD_RATE = 100; // 10% annual reward rate
+    uint256 public constant MAX_VALIDATORS = 21;
+    
+    // Layer-2 chain IDs
+    uint256 public constant ARBITRUM_CHAIN_ID = 42161;
+    uint256 public constant OPTIMISM_CHAIN_ID = 10;
+    uint256 public constant BASE_CHAIN_ID = 8453;
+    
+    // ===== DATA STRUCTURES =====
+    
+    struct PackedReport {
+        uint128 timestamp;    // 17 years sufficient
+        uint64 responseTime;  // Up to 584 years
+        uint32 statusCode;    // HTTP status codes
+        uint16 shardId;       // Up to 65535 shards
+        bool isReachable;     // 1 byte
+        bool sslValid;        // 1 byte
+    } // Total: 32 bytes (1 storage slot)
+    
+    struct Node {
+        address nodeAddress;
+        string nodeId;
+        uint256 reputation;      // 0-1000 (scaled by 1000)
+        uint256 ethStake;        // ETH staked for L1 security
+        uint256 monStake;        // MON tokens staked for reputation
+        uint256 votingPower;     // Combined voting power
+        uint256 lastReportTime;
+        uint256 totalReports;
+        uint256 successfulReports;
+        uint256 rewards;
+        bool isRegistered;
+        bool isActiveValidator;
+        uint256 shardId;
+    }
+    
+    struct Batch {
+        bytes32 batchHash;
+        bytes32 dataCommitment;  // IPFS hash for bulk data
+        uint256 timestamp;
+        address submitter;
+        uint256 reportCount;
+        uint256 targetLayer;     // 1=Ethereum, 2=Arbitrum, 3=Optimism, 4=Base
+        bool isFinalized;
+        uint256 gasUsed;
+    }
+    
+    struct CrossLayerMessage {
+        uint256 sourceChainId;
+        uint256 targetChainId;
+        bytes32 messageHash;
+        uint256 timestamp;
+        bool processed;
+    }
+    
+    // ===== STATE VARIABLES =====
+    
+    // Core mappings
+    mapping(bytes32 => PackedReport) public reports;
+    mapping(address => Node) public nodes;
+    mapping(uint256 => Batch) public batches;
+    mapping(bytes32 => CrossLayerMessage) public crossLayerMessages;
+    
+    // Arrays for enumeration
+    address[] public activeValidators;
+    bytes32[] public reportHashes;
+    uint256[] public batchIds;
+    
+    // Cross-layer contracts
+    mapping(uint256 => address) public layer2Contracts;
+    mapping(uint256 => address) public bridgeContracts;
+    
+    // Token contract
+    IERC20 public monToken;
+    
+    // Performance tracking
+    uint256 public totalReports;
+    uint256 public totalBatches;
+    uint256 public currentEpoch;
+    uint256 public totalEthStaked;
+    uint256 public totalMonStaked;
+    uint256 public totalRewardsDistributed;
+    
+    // Gas optimization
+    uint256 public baseFee;
+    uint256 public priorityFee;
+    mapping(uint256 => uint256) public layerGasMultipliers;
+    
+    // ===== EVENTS =====
+    
+    event NodeRegistered(address indexed nodeAddress, string indexed nodeId, uint256 shardId);
+    event ReportSubmitted(bytes32 indexed reportHash, address indexed submitter, string targetUrl);
+    event BatchProcessed(uint256 indexed batchId, bytes32 batchHash, uint256 reportCount, uint256 targetLayer);
+    event ReputationUpdated(address indexed nodeAddress, uint256 oldReputation, uint256 newReputation);
+    event ValidatorSlashed(address indexed validator, uint256 slashAmount);
+    event RewardsDistributed(address indexed validator, uint256 rewardAmount);
+    event CrossLayerMessageSent(uint256 indexed sourceChain, uint256 indexed targetChain, bytes32 messageHash);
+    event BatchFinalized(uint256 indexed batchId, bytes32 commitment);
+    
+    // ===== MODIFIERS =====
+    
+    modifier onlyRegisteredNode() {
+        require(nodes[msg.sender].isRegistered, "Node not registered");
+        _;
+    }
+    
+    modifier onlyActiveValidator() {
+        require(nodes[msg.sender].isActiveValidator, "Not an active validator");
+        _;
+    }
+    
+    modifier validEpoch(uint256 epochId) {
+        require(epochId <= currentEpoch, "Invalid epoch");
+        _;
+    }
+    
+    modifier sufficientGas() {
+        require(msg.value >= estimateGasCost(), "Insufficient gas");
+        _;
+    }
+    
+    // ===== CONSTRUCTOR =====
+    
+    constructor(address _monTokenAddress) {
+        monToken = IERC20(_monTokenAddress);
+        _transferOwnership(msg.sender);
+        
+        // Initialize epoch
+        currentEpoch = block.number / EPOCH_DURATION;
+        
+        // Set layer gas multipliers
+        layerGasMultipliers[ARBITRUM_CHAIN_ID] = 10;   // 10x cheaper
+        layerGasMultipliers[OPTIMISM_CHAIN_ID] = 20;   // 20x cheaper
+        layerGasMultipliers[BASE_CHAIN_ID] = 30;       // 30x cheaper
+        
+        // Update base fee
+        baseFee = block.basefee;
+    }
+    
+    // ===== NODE MANAGEMENT =====
+    
+    /**
+     * @dev Register a new monitoring node with ETH and MON stakes
+     * @param nodeId Unique node identifier
+     * @param shardId Geographic shard assignment
+     */
+    function registerNode(
+        string memory nodeId,
+        uint256 shardId
+    ) external payable nonReentrant sufficientGas {
+        require(!nodes[msg.sender].isRegistered, "Node already registered");
+        require(msg.value >= MIN_STAKE_ETH, "Insufficient ETH stake");
+        require(shardId < 65536, "Invalid shard ID");
+        
+        // Create new node
+        Node storage node = nodes[msg.sender];
+        node.nodeAddress = msg.sender;
+        node.nodeId = nodeId;
+        node.reputation = 500; // Start at neutral
+        node.ethStake = msg.value;
+        node.monStake = 0; // Will be set in separate function
+        node.votingPower = msg.value;
+        node.isRegistered = true;
+        node.shardId = shardId;
+        node.lastReportTime = block.timestamp;
+        
+        // Update total staked
+        totalEthStaked = totalEthStaked.add(msg.value);
+        
+        // Consider for validator set
+        if (msg.value >= MIN_STAKE_ETH * 10) {
+            _considerValidator(msg.sender);
+        }
+        
+        emit NodeRegistered(msg.sender, nodeId, shardId);
+    }
+    
+    /**
+     * @dev Stake MON tokens for additional reputation
+     * @param amount Amount of MON tokens to stake
+     */
+    function stakeMON(uint256 amount) external nonReentrant onlyRegisteredNode {
+        require(amount >= MIN_STAKE_MON, "Insufficient MON stake");
+        
+        Node storage node = nodes[msg.sender];
+        
+        // Transfer MON tokens
+        monToken.safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Update stake
+        node.monStake = node.monStake.add(amount);
+        node.votingPower = node.ethStake.add(amount);
+        
+        // Update total
+        totalMonStaked = totalMonStaked.add(amount);
+        
+        // Consider for validator set
+        if (node.votingPower >= MIN_STAKE_ETH * 10 && !node.isActiveValidator) {
+            _considerValidator(msg.sender);
+        }
+    }
+    
+    // ===== MONITORING FUNCTIONS =====
+    
+    /**
+     * @dev Submit a single monitoring report (gas optimized)
+     * @param reportHash Unique hash of the report data
+     * @param targetUrl Target URL being monitored
+     * @param responseTime Response time in milliseconds
+     * @param isReachable Whether the target is reachable
+     * @param sslValid SSL certificate validity
+     * @param statusCode HTTP status code
+     */
+    function submitReport(
+        bytes32 reportHash,
+        string calldata targetUrl,
+        uint256 responseTime,
+        bool isReachable,
+        bool sslValid,
+        uint256 statusCode
+    ) external payable nonReentrant onlyRegisteredNode sufficientGas {
+        require(reports[reportHash].timestamp == 0, "Report exists");
+        require(responseTime < 60000, "Invalid response time"); // Max 60 seconds
+        
+        // Create packed report (gas efficient)
+        reports[reportHash] = PackedReport({
+            timestamp: uint128(block.timestamp),
+            responseTime: uint64(responseTime),
+            statusCode: uint32(statusCode),
+            shardId: uint16(nodes[msg.sender].shardId),
+            isReachable: isReachable,
+            sslValid: sslValid
+        });
+        
+        // Add to reports array
+        reportHashes.push(reportHash);
+        
+        // Update node statistics
+        Node storage node = nodes[msg.sender];
+        node.totalReports++;
+        node.lastReportTime = block.timestamp;
+        
+        if (isReachable && sslValid && statusCode < 400) {
+            node.successfulReports++;
+        }
+        
+        // Update global counters
+        totalReports++;
+        
+        // Check for batch processing
+        if (reportHashes.length % BATCH_SIZE == 0) {
+            _processBatch(reportHashes.length - BATCH_SIZE, reportHashes.length, 1); // Ethereum L1
+        }
+        
+        // Refund unused gas
+        uint256 gasUsed = gasleft();
+        uint256 refund = (msg.value * gasUsed) / 50000; // Estimate 50k gas per report
+        
+        if (refund > 0) {
+            payable(msg.sender).transfer(refund);
+        }
+        
+        emit ReportSubmitted(reportHash, msg.sender, targetUrl);
+    }
+    
+    /**
+     * @dev Submit batch of reports for Layer-2 processing
+     * @param batchHash Hash of the batch
+     * @param dataCommitment IPFS hash for bulk data
+     * @param targetLayer Target layer (2=Arbitrum, 3=Optimism, 4=Base)
+     */
+    function submitBatchToLayer2(
+        bytes32 batchHash,
+        string calldata dataCommitment,
+        uint256 targetLayer
+    ) external nonReentrant onlyActiveValidator {
+        require(targetLayer >= 2 && targetLayer <= 4, "Invalid target layer");
+        require(layer2Contracts[targetLayer] != address(0), "Layer not configured");
+        
+        // Create batch record
+        uint256 batchId = totalBatches++;
+        Batch storage batch = batches[batchId];
+        
+        batch.batchHash = batchHash;
+        batch.dataCommitment = keccak256(abi.encodePacked(dataCommitment));
+        batch.timestamp = block.timestamp;
+        batch.submitter = msg.sender;
+        batch.reportCount = BATCH_SIZE;
+        batch.targetLayer = targetLayer;
+        batch.isFinalized = false;
+        
+        // Send cross-layer message
+        bytes32 messageHash = keccak256(abi.encodePacked(batchHash, dataCommitment, targetLayer));
+        _sendCrossLayerMessage(1, targetLayer, messageHash);
+        
+        emit BatchProcessed(batchId, batchHash, BATCH_SIZE, targetLayer);
+    }
+    
+    /**
+     * @dev Finalize batch from Layer-2 on Ethereum L1
+     * @param batchId Batch identifier
+     * @param proof Merkle proof of batch validity
+     */
+    function finalizeBatch(uint256 batchId, bytes32[] calldata proof) external nonReentrant {
+        Batch storage batch = batches[batchId];
+        require(!batch.isFinalized, "Already finalized");
+        require(block.timestamp - batch.timestamp < 86400, "Batch expired"); // 24 hours
+        
+        // Verify proof (simplified for example)
+        bool isValid = _verifyBatchProof(batch.batchHash, proof);
+        require(isValid, "Invalid proof");
+        
+        // Finalize batch
+        batch.isFinalized = true;
+        
+        // Update reputations based on batch results
+        _updateReputationsFromBatch(batch);
+        
+        emit BatchFinalized(batchId, batch.dataCommitment);
+    }
+    
+    // ===== INTERNAL FUNCTIONS =====
+    
+    function _processBatch(uint256 startIndex, uint256 endIndex, uint256 targetLayer) internal {
+        require(endIndex > startIndex, "Invalid batch range");
+        
+        uint256 batchId = totalBatches++;
+        Batch storage batch = batches[batchId];
+        
+        // Create batch hash
+        bytes32[] memory batchReports = new bytes32[](endIndex - startIndex);
+        for (uint256 i = 0; i < endIndex - startIndex; i++) {
+            batchReports[i] = reportHashes[startIndex + i];
+        }
+        
+        batch.batchHash = keccak256(abi.encodePacked(batchReports, block.timestamp));
+        batch.timestamp = block.timestamp;
+        batch.submitter = msg.sender;
+        batch.reportCount = endIndex - startIndex;
+        batch.targetLayer = targetLayer;
+        batch.isFinalized = (targetLayer == 1); // Auto-finalize L1 batches
+        
+        emit BatchProcessed(batchId, batch.batchHash, endIndex - startIndex, targetLayer);
+    }
+    
+    function _considerValidator(address nodeAddress) internal {
+        if (!nodes[nodeAddress].isActiveValidator && activeValidators.length < MAX_VALIDATORS) {
+            nodes[nodeAddress].isActiveValidator = true;
+            activeValidators.push(nodeAddress);
+        }
+    }
+    
+    function _updateReputationsFromBatch(Batch storage batch) internal {
+        // Simplified reputation update
+        Node storage node = nodes[batch.submitter];
+        uint256 oldReputation = node.reputation;
+        
+        // Calculate new reputation based on batch performance
+        uint256 successRate = (node.successfulReports * 1000) / node.totalReports;
+        uint256 newReputation = (oldReputation * 70 + successRate * 30) / 100;
+        
+        node.reputation = newReputation;
+        
+        emit ReputationUpdated(batch.submitter, oldReputation, newReputation);
+    }
+    
+    function _sendCrossLayerMessage(uint256 sourceChain, uint256 targetChain, bytes32 messageHash) internal {
+        crossLayerMessages[messageHash] = CrossLayerMessage({
+            sourceChainId: sourceChain,
+            targetChainId: targetChain,
+            messageHash: messageHash,
+            timestamp: block.timestamp,
+            processed: false
+        });
+        
+        emit CrossLayerMessageSent(sourceChain, targetChain, messageHash);
+    }
+    
+    function _verifyBatchProof(bytes32 batchHash, bytes32[] calldata proof) internal pure returns (bool) {
+        // Simplified proof verification
+        // In production, implement proper Merkle proof verification
+        return proof.length > 0;
+    }
+    
+    function estimateGasCost() internal view returns (uint256) {
+        // Estimate gas cost with EIP-1559
+        uint256 estimatedGas = 50000; // Base gas for report submission
+        uint256 currentBaseFee = block.basefee;
+        uint256 suggestedPriorityFee = 2 gwei; // 2 gwei priority fee
+        
+        return estimatedGas * (currentBaseFee + suggestedPriorityFee);
+    }
+    
+    // ===== VIEW FUNCTIONS =====
+    
+    /**
+     * @dev Get node reputation information
+     * @param nodeAddress Node address
+     * @return reputation Current reputation score
+     * @return ethStake ETH staked amount
+     * @return monStake MON tokens staked amount
+     * @return isActiveValidator Whether node is a validator
+     */
+    function getNodeInfo(address nodeAddress) external view returns (
+        uint256 reputation,
+        uint256 ethStake,
+        uint256 monStake,
+        bool isActiveValidator
+    ) {
+        Node storage node = nodes[nodeAddress];
+        return (
+            node.reputation,
+            node.ethStake,
+            node.monStake,
+            node.isActiveValidator
+        );
+    }
+    
+    /**
+     * @dev Get system performance metrics
+     * @return tps Current transactions per second
+     * @return totalReports Total reports submitted
+     * @return activeValidators Number of active validators
+     * @return totalEthStaked Total ETH staked
+     * @return totalMonStaked Total MON tokens staked
+     */
+    function getSystemMetrics() external view returns (
+        uint256 tps,
+        uint256 totalReports,
+        uint256 activeValidatorsCount,
+        uint256 totalEthStaked,
+        uint256 totalMonStaked
+    ) {
+        uint256 timeDiff = block.timestamp - (batches[totalBatches - 1].timestamp);
+        tps = timeDiff > 0 ? (totalReports * 1000) / timeDiff : 0;
+        
+        return (
+            tps,
+            totalReports,
+            activeValidators.length,
+            totalEthStaked,
+            totalMonStaked
+        );
+    }
+    
+    /**
+     * @dev Get report information
+     * @param reportHash Report hash
+     * @return timestamp Report timestamp
+     * @return responseTime Response time in ms
+     * @return statusCode HTTP status code
+     * @return isReachable Reachability status
+     * @return sslValid SSL validation status
+     */
+    function getReport(bytes32 reportHash) external view returns (
+        uint256 timestamp,
+        uint256 responseTime,
+        uint256 statusCode,
+        bool isReachable,
+        bool sslValid
+    ) {
+        PackedReport storage report = reports[reportHash];
+        return (
+            report.timestamp,
+            report.responseTime,
+            report.statusCode,
+            report.isReachable,
+            report.sslValid
+        );
+    }
+    
+    // ===== ADMIN FUNCTIONS =====
+    
+    /**
+     * @dev Configure Layer-2 contract address
+     * @param chainId Chain ID of the layer
+     * @param contractAddress Contract address on that layer
+     */
+    function configureLayer2(uint256 chainId, address contractAddress) external onlyOwner {
+        layer2Contracts[chainId] = contractAddress;
+    }
+    
+    /**
+     * @dev Configure bridge contract address
+     * @param chainId Chain ID of the layer
+     * @param bridgeAddress Bridge contract address
+     */
+    function configureBridge(uint256 chainId, address bridgeAddress) external onlyOwner {
+        bridgeContracts[chainId] = bridgeAddress;
+    }
+    
+    /**
+     * @dev Update gas multipliers for layers
+     * @param chainId Chain ID
+     * @param multiplier Gas multiplier
+     */
+    function updateGasMultiplier(uint256 chainId, uint256 multiplier) external onlyOwner {
+        layerGasMultipliers[chainId] = multiplier;
+    }
+    
+    /**
+     * @dev Emergency pause
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    /**
+     * @dev Unpause
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    
+    /**
+     * @dev Withdraw ETH from contract
+     * @param amount Amount to withdraw
+     */
+    function withdrawETH(uint256 amount) external onlyOwner {
+        require(address(this).balance >= amount, "Insufficient balance");
+        payable(owner()).transfer(amount);
+    }
+    
+    /**
+     * @dev Withdraw MON tokens from contract
+     * @param amount Amount to withdraw
+     */
+    function withdrawMON(uint256 amount) external onlyOwner {
+        require(monToken.balanceOf(address(this)) >= amount, "Insufficient balance");
+        monToken.safeTransfer(owner(), amount);
+    }
+}

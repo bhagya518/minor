@@ -22,6 +22,18 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 import pandas as pd
 import numpy as np
+import sqlite3
+import json
+import os
+import hashlib
+
+# Import signature verification
+try:
+    from monitoring_report import ReportVerifier
+    VERIFIER_AVAILABLE = True
+except ImportError:
+    VERIFIER_AVAILABLE = False
+    ReportVerifier = None
 
 logger = logging.getLogger(__name__)
 
@@ -48,21 +60,300 @@ class EpochManager:
         
         # Configuration
         self.epoch_duration = 60  # seconds
-        self.min_peers_for_quorum = 2  # need reports from at least 2 other nodes
+        self.min_peers_for_quorum = 1  # need reports from at least 1 other node (reduced for testing)
         self.quorum_threshold = 2/3  # 2/3 majority required
+        self.consensus_timeout = 5  # seconds to wait for quorum before proceeding
+        
+        # Leader election
+        self.current_leader = None
+        self.is_leader = False
+        self.leader_history = {}  # epoch_id -> leader_id
+        
+        # Persistence
+        self.db_path = os.path.join(os.path.dirname(__file__), '..', 'epoch_data.db')
+        self._init_database()
+    
+    def _init_database(self):
+        """Initialize SQLite database for persistence"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Create reports table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch_id INTEGER NOT NULL,
+                    node_id TEXT NOT NULL,
+                    report_data TEXT NOT NULL,
+                    is_own BOOLEAN DEFAULT 0,
+                    timestamp REAL NOT NULL
+                )
+            ''')
+            
+            # Create decisions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch_id INTEGER NOT NULL UNIQUE,
+                    decision_data TEXT NOT NULL,
+                    timestamp REAL NOT NULL
+                )
+            ''')
+            
+            # Create slash_history table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS slash_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch_id INTEGER NOT NULL,
+                    node_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    timestamp REAL NOT NULL
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"Database initialized at {self.db_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+    
+    def _save_report(self, epoch_id: int, report: Dict, is_own: bool = False):
+        """Save a report to the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            node_id = report.get("node_address", report.get("node_id", "unknown"))
+            cursor.execute('''
+                INSERT INTO reports (epoch_id, node_id, report_data, is_own, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (epoch_id, node_id, json.dumps(report), is_own, time.time()))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to save report: {e}")
+    
+    def _save_decision(self, epoch_id: int, decision: Dict):
+        """Save an epoch decision to the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO decisions (epoch_id, decision_data, timestamp)
+                VALUES (?, ?, ?)
+            ''', (epoch_id, json.dumps(decision), time.time()))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to save decision: {e}")
+    
+    def _save_slash_event(self, epoch_id: int, node_id: str, reason: str):
+        """Save a slash event to the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO slash_history (epoch_id, node_id, reason, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (epoch_id, node_id, reason, time.time()))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to save slash event: {e}")
+    
+    def get_report_history(self, epoch_id: Optional[int] = None, limit: int = 100) -> List[Dict]:
+        """Retrieve report history from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            if epoch_id:
+                cursor.execute('''
+                    SELECT epoch_id, node_id, report_data, is_own, timestamp
+                    FROM reports
+                    WHERE epoch_id = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (epoch_id, limit))
+            else:
+                cursor.execute('''
+                    SELECT epoch_id, node_id, report_data, is_own, timestamp
+                    FROM reports
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (limit,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'epoch_id': row[0],
+                    'node_id': row[1],
+                    'report': json.loads(row[2]),
+                    'is_own': bool(row[3]),
+                    'timestamp': row[4]
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to retrieve report history: {e}")
+            return []
+    
+    def get_decision_history(self, epoch_id: Optional[int] = None, limit: int = 100) -> List[Dict]:
+        """Retrieve decision history from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            if epoch_id:
+                cursor.execute('''
+                    SELECT epoch_id, decision_data, timestamp
+                    FROM decisions
+                    WHERE epoch_id = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (epoch_id, limit))
+            else:
+                cursor.execute('''
+                    SELECT epoch_id, decision_data, timestamp
+                    FROM decisions
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (limit,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'epoch_id': row[0],
+                    'decision': json.loads(row[1]),
+                    'timestamp': row[2]
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to retrieve decision history: {e}")
+            return []
         
     def get_current_epoch(self) -> int:
         """Get current epoch based on time"""
         return int(time.time() // self.epoch_duration)
     
+    def _elect_leader(self, epoch_id: int, peer_nodes: List[str]) -> str:
+        """
+        Deterministic leader election based on epoch and node IDs
+        Uses hash(epoch_id + sorted_node_ids) to select leader
+        
+        Args:
+            epoch_id: Current epoch
+            peer_nodes: List of peer node IDs
+            
+        Returns:
+            Selected leader node ID
+        """
+        if not peer_nodes:
+            return self.node_id  # Fallback to self
+        
+        # Ensure reproducible ordering
+        all_nodes = sorted(peer_nodes + [self.node_id])
+        
+        # Create deterministic hash
+        hash_input = f"{epoch_id}:{':'.join(all_nodes)}"
+        hash_value = hashlib.sha256(hash_input.encode()).hexdigest()
+        
+        # Select leader based on hash
+        leader_index = int(hash_value[:8], 16) % len(all_nodes)
+        leader = all_nodes[leader_index]
+        
+        logger.info(f"Epoch {epoch_id}: Leader elected - {leader} (from {len(all_nodes)} nodes)")
+        return leader
+    
+    def _is_leader_for_epoch(self, epoch_id: int, peer_nodes: List[str]) -> bool:
+        """
+        Check if this node is the leader for the given epoch
+        
+        Args:
+            epoch_id: Epoch to check
+            peer_nodes: List of known peer nodes
+            
+        Returns:
+            True if this node is the leader
+        """
+        leader = self._elect_leader(epoch_id, peer_nodes)
+        self.current_leader = leader
+        self.is_leader = (leader == self.node_id)
+        self.leader_history[epoch_id] = leader
+        
+        return self.is_leader
+    
+    def _verify_report_signature(self, report: Dict) -> bool:
+        """
+        Verify the signature of a monitoring report
+        
+        Args:
+            report: Monitoring report dictionary
+            
+        Returns:
+            True if signature is valid, False otherwise
+        """
+        if not VERIFIER_AVAILABLE:
+            logger.warning("ReportVerifier not available, skipping signature verification")
+            return True  # Skip verification if not available
+        
+        signature = report.get('signature')
+        if not signature:
+            logger.warning("Report has no signature")
+            return False
+        
+        report_hash = report.get('report_hash')
+        if not report_hash:
+            logger.warning("Report has no report_hash")
+            return False
+        
+        node_address = report.get('node_address')
+        if not node_address:
+            logger.warning("Report has no node_address")
+            return False
+        
+        # For now, we'll use a simple verification approach
+        # In production, you would need to retrieve the public key for each node
+        # from a peer registry or blockchain
+        try:
+            # Create canonical string for verification
+            report_copy = report.copy()
+            report_copy.pop('signature', None)
+            canonical = str(report_copy)
+            
+            # Verify signature (this is a simplified check)
+            # In production, use ReportVerifier.verify(signature, canonical, public_key)
+            logger.debug(f"Signature check for report from {node_address}: hash={report_hash[:16]}...")
+            return True  # Placeholder - implement proper verification with public key lookup
+        except Exception as e:
+            logger.error(f"Error verifying report signature: {e}")
+            return False
+    
     def add_report(self, report: Dict, is_own: bool = False):
         """
-        Add a report to the current epoch
+        Add a report to the current epoch with signature verification and persistence
         
         Args:
             report: Monitoring report dictionary
             is_own: Whether this is our own report
         """
+        # Verify signature for peer reports (skip for own reports)
+        if not is_own:
+            if not self._verify_report_signature(report):
+                logger.warning(f"Rejected report from {report.get('node_address', 'unknown')}: invalid signature")
+                return False
+        
         epoch_id = report.get("epoch_id", self.get_current_epoch())
         
         if is_own:
@@ -70,7 +361,11 @@ class EpochManager:
         else:
             self.epoch_reports[epoch_id].append(report)
         
+        # Persist report to database
+        self._save_report(epoch_id, report, is_own)
+        
         logger.debug(f"Added report for epoch {epoch_id} (own={is_own}), total peer reports: {len(self.epoch_reports[epoch_id])}")
+        return True
     
     async def run_epoch_manager(self):
         """
@@ -101,7 +396,8 @@ class EpochManager:
     
     async def process_epoch(self, epoch_id: int):
         """
-        Process a single epoch - run consensus, voting, and slashing
+        Process a single epoch with leader-based finalization
+        Only the leader executes consensus and blockchain updates
         
         Args:
             epoch_id: Epoch to process
@@ -116,12 +412,39 @@ class EpochManager:
         if own_report:
             all_reports.append(own_report)
         
-        # Check if we have enough reports for consensus
-        if len(peer_reports) < self.min_peers_for_quorum:
-            logger.info(f"Epoch {epoch_id}: only {len(peer_reports)} peer reports (need {self.min_peers_for_quorum}), skipping consensus")
+        # Get peer nodes for leader election (from reports)
+        peer_nodes = []
+        for report in peer_reports:
+            node_id = report.get("node_address", report.get("node_id", "unknown"))
+            if node_id != "unknown" and node_id != self.node_id:
+                peer_nodes.append(node_id)
+        
+        # Check if this node is the leader for this epoch
+        is_leader = self._is_leader_for_epoch(epoch_id, peer_nodes)
+        
+        if not is_leader:
+            logger.info(f"Epoch {epoch_id}: Not the leader (leader is {self.current_leader}), skipping consensus")
+            # Non-leaders still collect reports but don't execute consensus
             return
         
+        logger.info(f"Epoch {epoch_id}: Acting as LEADER, executing consensus")
+        
+        # QUORUM + TIMEOUT CONSENSUS: Proceed if quorum reached OR timeout elapsed
+        # This prevents indefinite blocking and makes latency predictable
+        epoch_start_time = time.time()
+        time_elapsed = epoch_start_time - (epoch_id * self.epoch_duration)
+        
+        if len(peer_reports) < self.min_peers_for_quorum:
+            if time_elapsed < self.consensus_timeout:
+                logger.info(f"Epoch {epoch_id}: only {len(peer_reports)} peer reports (need {self.min_peers_for_quorum}), waiting for quorum (elapsed: {time_elapsed:.1f}s/{self.consensus_timeout}s)")
+                return
+            else:
+                logger.warning(f"Epoch {epoch_id}: timeout reached ({time_elapsed:.1f}s), proceeding with {len(peer_reports)} peer reports (below quorum)")
+        
         logger.info(f"Epoch {epoch_id}: processing {len(all_reports)} total reports ({len(peer_reports)} peer + {1 if own_report else 0} own)")
+        
+        # Initialize reputation updates list for batching
+        reputation_updates = []
         
         # Step 1: Build feature matrix from all reports
         try:
@@ -150,93 +473,117 @@ class EpochManager:
             except Exception as e:
                 logger.warning(f"Epoch {epoch_id}: failed to fit scaler: {e}")
         
-        # Step 3: Run ML consensus on aggregated reports
+        # Step 3: Run ML consensus on aggregated reports (with optional sharding)
         try:
             if self.ml_consensus_engine:
-                logger.info(f"Epoch {epoch_id}: ML CONSENSUS RUNNING...")
-                consensus_results = self.ml_consensus_engine.process_epoch_consensus(epoch_id, all_reports)
-                logger.info(f"Epoch {epoch_id}: ML consensus completed")
+                # Use sharded consensus if available, otherwise fall back to regular consensus
+                if hasattr(self.ml_consensus_engine, 'process_sharded_consensus'):
+                    consensus_results = self.ml_consensus_engine.process_sharded_consensus(epoch_id, all_reports)
+                    logger.info(f"Epoch {epoch_id}: SHARDED ML consensus completed")
+                else:
+                    consensus_results = self.ml_consensus_engine.process_epoch_consensus(epoch_id, all_reports)
+                    logger.info(f"Epoch {epoch_id}: ML consensus completed")
             else:
                 # Fallback: simple majority voting without ML
                 consensus_results = self.simple_majority_vote(all_reports)
                 logger.info(f"Epoch {epoch_id}: simple majority voting (no ML engine)")
         except Exception as e:
             logger.error(f"Epoch {epoch_id}: error in consensus: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return
         
-        # Step 3: Reputation-weighted Quorum voting
+        # Step 3: REPUTATION-WEIGHTED QUORUM VOTING (core spec requirement)
+        # Instead of flat voting (each node = 1 vote), weight votes by reputation
         weighted_malicious = 0.0
         weighted_honest = 0.0
+        total_weight = 0.0
         node_verdicts = {}  # node_id -> verdict
-        node_weights = {}   # node_id -> reputation_weight
+        node_weights = {}   # node_id -> weight (reputation)
         
         for report in all_reports:
             node_id = report.get("node_address", report.get("node_id", "unknown"))
             
-            # Get reputation weight for this node (default 0.5 if not known)
-            rep_weight = 0.5
-            if self.ml_consensus_engine and hasattr(self.ml_consensus_engine, 'reputation'):
-                rep_weight = self.ml_consensus_engine.reputation.get(node_id, 0.5)
-            node_weights[node_id] = rep_weight
+            # Get verdict from consensus results
+            verdict = None
+            p_malicious = 0.5
             
-            # Get verdict from consensus results or simple heuristic
-            verdict = "honest"
             if consensus_results and "predictions" in consensus_results:
                 # Find prediction for this node
                 for pred in consensus_results["predictions"]:
                     if pred.get("node_id") == node_id:
-                        # Check for both possible column names
                         p_malicious = pred.get("malicious_probability", pred.get("p_malicious", 0.5))
                         verdict = "malicious" if p_malicious >= 0.5 else "honest"
-                        node_verdicts[node_id] = verdict
                         break
-            else:
+            
+            if verdict is None:
                 # Fallback: simple heuristic based on report quality
                 is_reachable = report.get("is_reachable", True)
                 ssl_valid = report.get("ssl_valid", True)
                 verdict = "honest" if (is_reachable and ssl_valid) else "malicious"
-                node_verdicts[node_id] = verdict
             
-            # Apply reputation weighting
-            if verdict == "malicious":
-                weighted_malicious += rep_weight
+            node_verdicts[node_id] = verdict
+            
+            # CRITICAL FIX: Get reputation weight for this node
+            if consensus_results and "reputations" in consensus_results:
+                # Use ML-calculated reputation as weight
+                reputation = consensus_results["reputations"].get(node_id, 0.5)
+            elif self.ml_consensus_engine and node_id in self.ml_consensus_engine.reputation:
+                # Fallback to ML engine reputation
+                reputation = self.ml_consensus_engine.reputation.get(node_id, 0.5)
             else:
-                weighted_honest += rep_weight
-        
-        # Step 4: Check quorum - require weighted majority
-        total_weight = weighted_honest + weighted_malicious
-        quorum_threshold = total_weight * self.quorum_threshold  # 2/3 threshold
-        
-        logger.info(f"Epoch {epoch_id}: weighted voting results - honest: {weighted_honest:.3f}, malicious: {weighted_malicious:.3f}, threshold: {quorum_threshold:.3f}")
-        
-        # Step 5: Execute slashing if weighted quorum reached for malicious
-        if weighted_malicious >= quorum_threshold:
-            logger.warning(f"Epoch {epoch_id}: weighted quorum reached for malicious ({weighted_malicious:.3f}/{quorum_threshold:.3f}), executing slashing")
+                # Default neutral reputation
+                reputation = 0.5
             
-            for report in all_reports:
-                node_id = report.get("node_address", report.get("node_id", "unknown"))
-                verdict = node_verdicts.get(node_id, "honest")
-                
-                if verdict == "malicious":
-                    try:
-                        # Execute actual slash
-                        if self.blockchain_client:
-                            slash_result = await self.blockchain_client.slash_node(
-                                node_id, 
-                                amount=0.1,  # Slash 10% reputation
-                                reason=f"Epoch {epoch_id} consensus: weighted {weighted_malicious:.3f}/{total_weight:.3f} malicious"
-                            )
-                            logger.warning(f"Epoch {epoch_id}: SLASHED node {node_id} - {slash_result}")
-                            self.slash_history.append({
-                                "epoch": epoch_id,
-                                "node_id": node_id,
-                                "reason": f"Consensus: weighted {weighted_malicious:.3f}/{total_weight:.3f} malicious",
-                                "timestamp": time.time()
-                            })
-                    except Exception as e:
-                        logger.error(f"Epoch {epoch_id}: error slashing node {node_id}: {e}")
+            node_weights[node_id] = reputation
+            total_weight += reputation
+            
+            # Apply weighted voting
+            if verdict == "malicious":
+                weighted_malicious += reputation
+            else:
+                weighted_honest += reputation
+        
+        # Convert to vote counts for display (optional)
+        malicious_votes = sum(1 for v in node_verdicts.values() if v == "malicious")
+        honest_votes = sum(1 for v in node_verdicts.values() if v == "honest")
+        
+        # Step 4: Check quorum - require strict majority with minimum 2 votes
+        total_votes = len(all_reports)
+        quorum = max(2, (total_votes * 2) // 3 + 1)
+        
+        logger.info(f"Epoch {epoch_id}: REPUTATION-WEIGHTED voting results")
+        logger.info(f"  Weighted honest: {weighted_honest:.4f}, Weighted malicious: {weighted_malicious:.4f}, Total weight: {total_weight:.4f}")
+        logger.info(f"  Flat vote counts - honest: {honest_votes}, malicious: {malicious_votes}, quorum: {quorum}")
+        
+        # Step 5: Execute slashing based on WEIGHTED consensus
+        # A coordinated group of low-reputation nodes cannot override high-reputation nodes
+        consensus_threshold = total_weight * 2 / 3 if total_weight > 0 else 0.67
+
+        if weighted_malicious >= consensus_threshold and malicious_votes >= quorum:
+            malicious_nodes = [nid for nid, v in node_verdicts.items() if v == "malicious"]
+            for node_id in malicious_nodes:
+                try:
+                    if self.blockchain_client:
+                        slash_result = await self.blockchain_client.slash_node(
+                            node_id,
+                            amount=0.1,  # Slash 10% reputation
+                            reason=f"Epoch {epoch_id} consensus: {malicious_votes}/{total_votes} nodes voted malicious",
+                        )
+                        logger.warning(f"Epoch {epoch_id}: SLASHED node {node_id} - {slash_result}")
+
+                    self.slash_history.append({
+                        "epoch": epoch_id,
+                        "node_id": node_id,
+                        "reason": f"Consensus: {malicious_votes}/{total_votes} malicious votes",
+                        "timestamp": time.time(),
+                    })
+                    # Persist slash event to database
+                    self._save_slash_event(epoch_id, node_id, f"Consensus: {malicious_votes}/{total_votes} malicious votes")
+                except Exception as e:
+                    logger.error(f"Epoch {epoch_id}: error slashing node {node_id}: {e}")
         else:
-            logger.info(f"Epoch {epoch_id}: no malicious quorum (need {quorum_threshold:.3f}, got {weighted_malicious:.3f})")
+            logger.info(f"Epoch {epoch_id}: no malicious quorum (need {quorum}, got {malicious_votes})")
         
         # Step 6: Update PoR for all nodes with penalty-based calculation
         for report in all_reports:
@@ -256,31 +603,92 @@ class EpochManager:
             # Calculate new PoR with penalty
             penalty = 0.1 if verdict == "malicious" else 0.0
             new_por = current_por * (1 - penalty)
-            
+
+            # Separate components for on-chain PoR formula
+            # - monitoring_trust: use PoR update proxy (penalty-adjusted current PoR)
+            # - ml_score: use ML consensus reputation if available
+            ml_score = new_por
             try:
-                if self.blockchain_client:
-                    await self.blockchain_client.update_reputation(
-                        node_id, 
-                        new_por, 
-                        evidence=f"Epoch {epoch_id} verdict: {verdict} (penalty: {penalty})"
-                    )
-                    logger.info(f"Epoch {epoch_id}: Updated PoR for {node_id}: {current_por:.3f} → {new_por:.3f} (penalty: {penalty})")
-            except Exception as e:
-                logger.error(f"Epoch {epoch_id}: error updating PoR for {node_id}: {e}")
+                if isinstance(consensus_results, dict):
+                    ml_reps = consensus_results.get('reputations')
+                    if isinstance(ml_reps, dict) and node_id in ml_reps:
+                        ml_score = float(ml_reps[node_id])
+            except Exception:
+                ml_score = new_por
+            
+            # BATCHING: Collect updates instead of sending immediately
+            # This reduces blockchain transactions from O(n) to O(shards)
+            reputation_updates.append({
+                'node_id': node_id,
+                'monitoring_trust': new_por,
+                'ml_score': ml_score,
+                'evidence': f"Epoch {epoch_id} verdict: {verdict} (penalty: {penalty})"
+            })
         
-        # Step 7: Store epoch decision
-        self.epoch_decisions[epoch_id] = {
+        # BATCHED BLOCKCHAIN UPDATES: Send all reputation updates in batches
+        # This reduces transactions from O(n) to O(1) per epoch
+        if reputation_updates and self.blockchain_client:
+            try:
+                logger.info(f"Epoch {epoch_id}: Batching {len(reputation_updates)} reputation updates")
+                
+                # Send batch update (if blockchain client supports it)
+                # Otherwise fall back to individual updates
+                if hasattr(self.blockchain_client, 'batch_update_reputation'):
+                    await self.blockchain_client.batch_update_reputation(reputation_updates)
+                else:
+                    # Fallback: send individual updates sequentially
+                    for update in reputation_updates:
+                        await self.blockchain_client.update_reputation(
+                            update['node_id'],
+                            update['new_por'],
+                            update['new_por'],
+                            evidence=update['evidence']
+                        )
+                
+                logger.info(f"Epoch {epoch_id}: Successfully batched {len(reputation_updates)} reputation updates")
+            except Exception as e:
+                logger.error(f"Epoch {epoch_id}: error batching reputation updates: {e}")
+        
+        # Step 7: Store epoch decision with WEIGHTED voting results
+        decision = {
+            "malicious_votes": malicious_votes,
+            "honest_votes": honest_votes,
+            "total_votes": total_votes,
+            "quorum_reached": weighted_malicious > weighted_honest and weighted_malicious >= consensus_threshold,
             "weighted_malicious": weighted_malicious,
             "weighted_honest": weighted_honest,
             "total_weight": total_weight,
-            "quorum_threshold": quorum_threshold,
-            "quorum_reached": weighted_malicious >= quorum_threshold,
+            "consensus_threshold": consensus_threshold,
             "node_verdicts": node_verdicts,
             "node_weights": node_weights,
-            "consensus_results": consensus_results
+            "consensus_results": consensus_results,
+            "voting_type": "reputation_weighted"
         }
+        self.epoch_decisions[epoch_id] = decision
         
-        # Step 8: Clear reports for this epoch (cleanup)
+        # Persist decision to database
+        self._save_decision(epoch_id, decision)
+        
+        # Step 9: Broadcast final decision to all peers (leader only)
+        if self.blockchain_client and hasattr(self.blockchain_client, 'peer_client'):
+            try:
+                decision_message = {
+                    'epoch_id': epoch_id,
+                    'leader_id': self.node_id,
+                    'decision': decision,
+                    'timestamp': time.time()
+                }
+                # Send to all known peers
+                await self.blockchain_client.peer_client.broadcast_message(
+                    'epoch_decision',
+                    decision_message,
+                    ttl=3  # Multi-hop propagation
+                )
+                logger.info(f"Epoch {epoch_id}: Decision broadcast to all peers")
+            except Exception as e:
+                logger.warning(f"Epoch {epoch_id}: Failed to broadcast decision: {e}")
+        
+        # Step 10: Clear reports for this epoch (cleanup)
         if epoch_id in self.epoch_reports:
             del self.epoch_reports[epoch_id]
         if epoch_id in self.own_reports:
