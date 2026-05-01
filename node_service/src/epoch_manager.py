@@ -844,7 +844,18 @@ class EpochManager:
                 'evidence': f"Epoch {epoch_id} verdict: {verdict} (penalty: {penalty})"
             })
         
-        # Step 7: Build decision dict FIRST
+        # Step 7: Batch update all node reputations to blockchain
+        if reputation_updates and self.blockchain_client:
+            try:
+                batch_result = self.blockchain_client.batch_update_reputation(reputation_updates)
+                if batch_result.get('success'):
+                    logger.info(f"Epoch {epoch_id}: Batch updated {len(reputation_updates)} node reputations on blockchain")
+                else:
+                    logger.error(f"Epoch {epoch_id}: Failed to batch update reputations: {batch_result.get('error')}")
+            except Exception as e:
+                logger.error(f"Epoch {epoch_id}: Error batch updating reputations: {e}")
+        
+        # Step 8: Build decision dict FIRST
         decision = {
             "malicious_votes": malicious_votes,
             "honest_votes": honest_votes,
