@@ -1,5 +1,12 @@
-const { ethers, network } = require("hardhat");
-require("dotenv").config();
+import pkg from "hardhat";
+import "dotenv/config";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const { ethers, network } = pkg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 async function main() {
   console.log("Deploying ProofOfReputation contract...");
@@ -17,10 +24,6 @@ async function main() {
   const deploymentTx = proofOfReputation.deploymentTransaction();
   console.log("ProofOfReputation deployed to:", contractAddress);
   console.log("Transaction hash:", deploymentTx.hash);
-  
-  // Save contract address and ABI for frontend integration
-  const fs = require("fs");
-  const path = require("path");
   
   // Create deployment info
   const signer = await ethers.provider.getSigner();

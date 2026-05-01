@@ -581,7 +581,16 @@ class EpochManager:
         logger.info(f"Processing epoch {epoch_id}")
         
         # Step 1: Elect leader for this epoch
-        leader = self._elect_leader(epoch_id)
+        # Get peer nodes from reports for leader election
+        peer_nodes = set()
+        for report in peer_reports:
+            node_id = report.get("node_address", report.get("node_id", ""))
+            if node_id:
+                peer_nodes.add(node_id)
+        if own_report:
+            peer_nodes.add(self.node_id)
+        
+        leader = self._elect_leader(epoch_id, list(peer_nodes))
         
         # Step 2: Collect all reports for this epoch
         peer_reports = self.epoch_reports.get(epoch_id, [])

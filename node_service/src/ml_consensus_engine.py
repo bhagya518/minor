@@ -106,10 +106,10 @@ class EnhancedMLConsensusEngine:
         try:
             # Try multiple possible paths for models
             possible_paths = [
-                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ml', 'models'),
-                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), 'ml', 'models'),
-                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'ml', 'models')),
-                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'ml', 'models')),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ML_MINOR', 'models'),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), 'ML_MINOR', 'models'),
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'ML_MINOR', 'models')),
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'ML_MINOR', 'models')),
             ]
             
             model_path = None
@@ -832,6 +832,7 @@ class EnhancedMLConsensusEngine:
         # Build predictions list for epoch_manager compatibility
         for node_id, rep in global_results['reputations'].items():
             mitigation = global_results['mitigation_actions'].get(node_id, {})
+            
             results['predictions'].append({
                 'node_id': node_id,
                 'malicious_probability': 1.0 - rep,

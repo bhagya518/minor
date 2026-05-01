@@ -119,6 +119,11 @@ class NodeSigner:
         
         return report
     
+    def sign(self, message: str) -> str:
+        """Sign a message string and return signature as hex"""
+        signature_bytes = self._private.sign(message.encode())
+        return signature_bytes.hex()
+    
     def export_private_key_hex(self) -> str:
         """Export private key for saving to config file"""
         raw = self._private.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
@@ -181,7 +186,23 @@ class ReportVerifier:
     @staticmethod
     def from_dict(data: dict) -> MonitoringReport:
         """Create report from dictionary (e.g., after P2P transmission)"""
-        return MonitoringReport(**data)
+        # Filter out fields that shouldn't be passed to __init__
+        init_fields = {}
+        for key, value in data.items():
+            if key not in ['report_hash', 'signature', 'public_key']:
+                init_fields[key] = value
+        
+        report = MonitoringReport(**init_fields)
+        
+        # Set the fields that were filtered out
+        if 'report_hash' in data:
+            report.report_hash = data['report_hash']
+        if 'signature' in data:
+            report.signature = data['signature']
+        if 'public_key' in data:
+            report.public_key = data['public_key']
+        
+        return report
 
 
 def current_epoch(window_seconds: int = 60) -> int:

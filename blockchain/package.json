@@ -34,5 +34,5 @@
   "directories": {
     "test": "test"
   },
-  "type": "commonjs"
+  "type": "module"
 }
