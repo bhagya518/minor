@@ -293,13 +293,17 @@ class EnhancedMLConsensusEngine:
                 # Use Gradient Boosting meta-learner (spec-compliant)
                 meta_features = np.array([[rf_prob, iso_norm, 0.0]])  # 3rd feature placeholder for graph
                 meta_proba = self.meta_model.predict_proba(meta_features)[0]
-                risk = meta_proba[1] if len(meta_proba) > 1 else meta_proba[0]  # Probability of malicious
-                logger.debug(f"Meta-learner risk: {risk}")
+                # CRITICAL FIX: RF model predicts Class 1 = HONEST, so use probability directly as reputation
+                reputation = meta_proba[1] if len(meta_proba) > 1 else meta_proba[0]  # Probability of honest
+                logger.debug(f"Meta-learner reputation: {reputation}")
             else:
-                # Fallback: 70% RF + 30% ISO fusion (original approach)
-                risk = (0.7 * rf_prob) + (0.3 * iso_norm)
+                # CRITICAL FIX: RF model predicts Class 1 = HONEST, so rf_prob IS the reputation
+                # ISO detects anomalies (higher = more anomalous), so invert it
+                iso_reputation = 1.0 - iso_norm
+                # Fallback: 70% RF (honest probability) + 30% ISO (honest probability)
+                reputation = (0.7 * rf_prob) + (0.3 * iso_reputation)
             
-            reputation = 1.0 - float(np.clip(risk, 0.0, 1.0))
+            reputation = float(np.clip(reputation, 0.0, 1.0))
             logger.debug(f"Final reputation: {reputation}")
             
             return reputation
