@@ -306,8 +306,9 @@ def main():
     st.sidebar.header("Actions")
 
     if st.sidebar.button("Trigger Monitoring on All Nodes"):
+        default_urls = ["https://httpbin.org/get", "https://google.com", "https://github.com"]
         for node_url in ALL_NODES:
-            _post(f"{node_url}/monitor", {})
+            _post(f"{node_url}/monitor", {"urls": default_urls})
 
     # ── Sidebar ────────────────────────────────────────────────────────────
     with st.sidebar:

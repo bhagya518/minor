@@ -769,7 +769,7 @@ class EpochManager:
                     amounts = [0.1] * len(malicious_nodes)  # 10% slash each
                     reason = f"Epoch {epoch_id} consensus: {malicious_votes}/{total_votes} nodes voted malicious"
                     
-                    batch_result = await self.blockchain_client.batch_slash_nodes(
+                    batch_result = self.blockchain_client.batch_slash_nodes(
                         node_ids=node_ids,
                         amounts=amounts,
                         reason=reason,
@@ -782,7 +782,7 @@ class EpochManager:
                         # Fallback to individual slashing
                         logger.error(f"Batch slashing failed, trying individual slashes")
                         for node_id in malicious_nodes:
-                            slash_result = await self.blockchain_client.slash_node(
+                            slash_result = self.blockchain_client.slash_node(
                                 node_id=node_id,
                                 amount=0.1,
                                 reason=reason,
@@ -802,7 +802,8 @@ class EpochManager:
             # Get current PoR from blockchain
             try:
                 if self.blockchain_client:
-                    current_por = await self.blockchain_client.get_reputation(node_id)
+                    rep_data = self.blockchain_client.get_node_reputation(node_id)  # sync call
+                    current_por = rep_data["reputation"] if rep_data else 0.95
                 else:
                     current_por = 0.95  # Default if no blockchain
             except Exception as e:
@@ -834,13 +835,30 @@ class EpochManager:
                 'evidence': f"Epoch {epoch_id} verdict: {verdict} (penalty: {penalty})"
             })
         
-        # BLOCKCHAIN FINALITY: Leader submits epoch decision to blockchain
-        # This makes blockchain the source of truth for consensus
+        # Step 7: Build decision dict FIRST
+        decision = {
+            "malicious_votes": malicious_votes,
+            "honest_votes": honest_votes,
+            "total_votes": total_votes,
+            "quorum_reached": weighted_malicious > weighted_honest and weighted_malicious >= consensus_threshold,
+            "weighted_malicious": weighted_malicious,
+            "weighted_honest": weighted_honest,
+            "total_weight": total_weight,
+            "consensus_threshold": consensus_threshold,
+            "node_verdicts": node_verdicts,
+            "node_weights": node_weights,
+            "consensus_results": consensus_results,
+            "voting_type": "reputation_weighted",
+            "blockchain_committed": False,
+            "blockchain_tx": None
+        }
+        self.epoch_decisions[epoch_id] = decision
+        
+        # Step 8: THEN submit to blockchain
         if self.is_leader and self.blockchain_client:
             try:
                 logger.info(f"Epoch {epoch_id}: Leader submitting decision to blockchain (source of truth)")
                 
-                # Submit epoch decision to blockchain
                 blockchain_result = await self.blockchain_client.submit_epoch_decision(epoch_id, decision)
                 
                 if blockchain_result['success']:
@@ -861,25 +879,6 @@ class EpochManager:
             else:
                 logger.warning(f"Epoch {epoch_id}: No blockchain client - decision is local only")
                 decision['blockchain_committed'] = False
-        
-        # Step 7: Store epoch decision with WEIGHTED voting results
-        decision = {
-            "malicious_votes": malicious_votes,
-            "honest_votes": honest_votes,
-            "total_votes": total_votes,
-            "quorum_reached": weighted_malicious > weighted_honest and weighted_malicious >= consensus_threshold,
-            "weighted_malicious": weighted_malicious,
-            "weighted_honest": weighted_honest,
-            "total_weight": total_weight,
-            "consensus_threshold": consensus_threshold,
-            "node_verdicts": node_verdicts,
-            "node_weights": node_weights,
-            "consensus_results": consensus_results,
-            "voting_type": "reputation_weighted",
-            "blockchain_committed": False,  # Will be set by blockchain commit
-            "blockchain_tx": None
-        }
-        self.epoch_decisions[epoch_id] = decision
         
         # Persist decision to database
         await self._save_decision(epoch_id, decision)

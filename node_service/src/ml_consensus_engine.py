@@ -184,6 +184,25 @@ class EnhancedMLConsensusEngine:
             logger.error(f"❌ Failed to load enhanced models: {e}")
             logger.info("Will fall back to basic consensus")
     
+    def update_node_reputation(self, node_id: str, trust_score: float):
+        """Simple method to update node reputation from trust score"""
+        try:
+            # Store reputation
+            self.reputation[node_id] = trust_score
+            self.reputation_history[node_id].append(trust_score)
+            
+            # Apply EWMA smoothing
+            smoothed_reputation = self.apply_ewma_smoothing(node_id, trust_score)
+            
+            # Apply mitigation policy
+            decision = self.apply_mitigation_policy(smoothed_reputation)
+            self.mitigation_actions[node_id] = decision
+            
+            logger.debug(f"Updated reputation for {node_id}: {trust_score:.4f} -> {smoothed_reputation:.4f}")
+            
+        except Exception as e:
+            logger.error(f"Error updating reputation for {node_id}: {e}")
+    
     def apply_mitigation_policy(self, reputation_score: float) -> MitigationDecision:
         """Apply 4-tier mitigation policy from ML_MINOR"""
         if reputation_score > self.HEALTHY_T:
@@ -543,21 +562,28 @@ class EnhancedMLConsensusEngine:
             rt_variance = 0.0
             rt_std = 0.0
         
-        # Enhanced feature extraction with more dynamic values
+        # Calculate itt_jitter: variance between consecutive report timestamps
+        timestamps = sorted([r.get("timestamp", 0) for r in sender_reports if r.get("timestamp")])
+        if len(timestamps) > 1:
+            itts = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+            itt_jitter = float(np.std(itts)) / (float(np.mean(itts)) + 1e-6)
+            itt_jitter = min(itt_jitter, 1.0)
+        else:
+            itt_jitter = 0.1  # single report — assume normal
+        
+        # Fixed feature extraction to match ML model expectations (11 features only)
         features = {
             "accuracy": success_rate,
             "false_positive_rate": max(0.0, 1.0 - success_rate - 0.1) if success_rate > 0.5 else 0.0,
             "false_negative_rate": max(0.0, 1.0 - success_rate) if success_rate <= 0.5 else 0.0,
             "avg_rt_error": min(avg_response_time / 1000.0, 1.0),  # Normalize to seconds
-            "max_rt_error": min(max_response_time / 1000.0, 1.0),
             "peer_agreement_rate": peer_agreement_rate,
-            "historical_accuracy": success_rate,
-            "accuracy_std_dev": min(rt_std / 1000.0, 1.0) if response_times else 0.1,
             "report_consistency": 1.0 - min(rt_variance / 1000000.0, 1.0) if response_times else 0.5,
             "sudden_change_score": 0.3 if success_rate > 0.8 else 0.7,  # Will be enhanced with historical tracking
             "ssl_accuracy": ssl_accuracy,
             "uptime_deviation": abs(success_rate - 0.99),  # Deviation from ideal uptime
             "rt_consistency": 1.0 - min(rt_std / 1000.0, 1.0) if response_times else 0.5,
+            "itt_jitter": itt_jitter,  # ADDED: Inter-transmission time jitter
         }
         
         logger.debug(f"Features for sender {sender_id}: {features}")

@@ -541,8 +541,17 @@ class WebsiteMonitor:
         # Calculate stale report rate (old timestamps)
         current_time = datetime.now()
         stale_threshold = 300  # 5 minutes
-        stale_count = sum(1 for r in results 
-                        if (current_time - datetime.fromisoformat(r['timestamp'])).total_seconds() > stale_threshold)
+        def _parse_ts(r):
+            ts = r.get('timestamp', 0)
+            try:
+                return datetime.fromisoformat(ts) if isinstance(ts, str) else datetime.fromtimestamp(float(ts))
+            except Exception:
+                return None
+        
+        stale_count = sum(
+            1 for r in results
+            if (t := _parse_ts(r)) and (current_time - t).total_seconds() > stale_threshold
+        )
         stale_report_rate = stale_count / len(results) if results else 0
         
         # Calculate false report rate (error status)

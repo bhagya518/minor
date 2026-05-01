@@ -35,7 +35,7 @@ parser.add_argument('--websites', type=str, nargs='+',
 # Add src directory to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -224,9 +224,8 @@ async def startup_event():
         website_monitor = WebsiteMonitor()
         trust_engine = TrustEngine()
         
-        # Initialize peer client with unique P2P port (API port + 1000)
-        p2p_port = node_config.port + 1000
-        peer_client = PeerClient(node_config.node_id, node_config.host, p2p_port)
+        # Initialize peer client (it will compute its own P2P port as API port + 1000)
+        peer_client = PeerClient(node_config.node_id, node_config.host, node_config.port)
         await peer_client.start_server()
         
         # Set node signer for P2P message authentication
@@ -495,12 +494,24 @@ async def run_consensus_and_slash():
         logger.info(f"Triggering consensus for epoch {epoch_id}")
         await epoch_manager.process_epoch(epoch_id)
         
-        # Store verdicts for /verdict endpoint
-        # The epoch_manager stores verdicts internally, we'll track them here
+        # Pull the real decision that epoch_manager built
+        epoch_decision = epoch_manager.epoch_decisions.get(epoch_id, {})
+        node_verdicts  = epoch_decision.get("node_verdicts", {})
+        node_weights   = epoch_decision.get("node_weights", {})
+
+        slashed = [nid for nid, v in node_verdicts.items() if v == "malicious"]
+        honest  = [nid for nid, v in node_verdicts.items() if v == "honest"]
+        majority = "down" if epoch_decision.get("quorum_reached") else "up"
+
         verdicts_store[str(epoch_id)] = {
-            "epoch_id": epoch_id,
-            "timestamp": datetime.now().isoformat(),
-            "status": "processed"
+            "epoch_id":        epoch_id,
+            "timestamp":       datetime.now().isoformat(),
+            "majority_verdict": majority,
+            "honest":          honest,
+            "slashed":         slashed,
+            "node_reputations": node_weights,
+            "weighted_malicious": epoch_decision.get("weighted_malicious", 0.0),
+            "weighted_honest":    epoch_decision.get("weighted_honest", 0.0),
         }
         
         logger.info(f"Consensus completed for epoch {epoch_id}")
@@ -544,20 +555,18 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
             is_reachable = report.get("is_reachable", True)
             
             features = {
-                # Map monitoring features to ML model features
+                # Map monitoring features to ML model features (11 features only)
                 "accuracy": 0.95 if is_reachable else 0.1,  # High accuracy for reachable sites
                 "false_positive_rate": 0.05 if is_reachable else 0.8,  # Low false positives for honest nodes
                 "false_negative_rate": 0.05 if is_reachable else 0.8,  # Low false negatives for honest nodes
                 "avg_rt_error": min(response_time / 1000.0, 0.5),  # Cap at 0.5 seconds, lower is better
-                "max_rt_error": min(response_time / 1000.0, 0.5),  # Cap at 0.5 seconds
                 "peer_agreement_rate": 0.9 if is_reachable else 0.3,  # High agreement for honest nodes
-                "historical_accuracy": 0.9 if is_reachable else 0.3,  # High historical accuracy
-                "accuracy_std_dev": 0.1 if is_reachable else 0.4,  # Low deviation for consistent nodes
                 "report_consistency": 0.9 if is_reachable else 0.3,  # High consistency
                 "sudden_change_score": 0.1 if is_reachable else 0.7,  # Low sudden changes for honest nodes
                 "ssl_accuracy": 0.95 if report.get("ssl_valid", True) else 0.2,  # High SSL accuracy
                 "uptime_deviation": 0.1 if is_reachable else 0.5,  # Low uptime deviation
                 "rt_consistency": 0.9 if is_reachable else 0.3,  # High response time consistency
+                "itt_jitter": 0.1 if is_reachable else 0.4,  # Low jitter for consistent nodes
             }
             
             # Calculate ML-based reputation
@@ -681,10 +690,15 @@ async def process_monitoring_results():
             ml_score = 0.5
             ml_prediction = 'unknown'
         
+        # Update ML consensus engine reputation with trust score
+        if ml_consensus:
+            ml_consensus.update_node_reputation(node_config.node_id, trust_score)
+        
         # Calculate PoR score
         por_score = TrustCalculator.calculate_por_score(trust_score, ml_score)
         
         logger.info(f"Trust: {trust_score:.4f}, ML: {ml_score:.4f}, PoR: {por_score:.4f}")
+        logger.info(f"Reputation updated for {node_config.node_id}: {trust_score:.4f}")
         
         # REMOVED: Per-node blockchain writes
         # Blockchain writes now handled by epoch_manager leader only (batch per epoch)
