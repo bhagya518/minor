@@ -525,4 +525,67 @@ contract ProofOfReputation {
     function getTotalSlashCount() external view returns (uint256) {
         return slashHistory.length;
     }
+    
+    /**
+     * @dev Submit epoch decision with verdicts and reputations
+     * @param epochId Epoch identifier
+     * @param nodeIds Array of node IDs
+     * @param verdicts Array of verdicts (1=malicious, 0=honest)
+     * @param reputations Array of reputation scores
+     */
+    function submitEpochDecision(
+        uint256 epochId,
+        string[] memory nodeIds,
+        uint256[] memory verdicts,
+        uint256[] memory reputations
+    ) external onlyAggregator {
+        require(nodeIds.length == verdicts.length && nodeIds.length == reputations.length, "Array length mismatch");
+        require(epochId > 0, "Epoch ID must be > 0");
+        
+        // Store epoch decision
+        for (uint256 i = 0; i < nodeIds.length; i++) {
+            require(nodes[nodeIds[i]].isRegistered, "Node must be registered");
+            require(bytes(nodeIds[i]).length > 0, "Node ID cannot be empty");
+            require(reputations[i] <= 1000, "Reputation must be <= 1000");
+            require(verdicts[i] <= 1, "Verdict must be 0 or 1");
+            
+            // Update node reputation
+            nodes[nodeIds[i]].reputation = reputations[i];
+            nodes[nodeIds[i]].lastUpdated = block.timestamp;
+            
+            // Record verdict for historical tracking
+            emit ReputationUpdated(nodeIds[i], reputations[i], nodes[nodeIds[i]].monitoringTrust, nodes[nodeIds[i]].mlScore);
+        }
+        
+        // Emit epoch decision event
+        emit EpochDecisionSubmitted(epochId, nodeIds.length);
+    }
+    
+    /**
+     * @dev Get epoch decision for verification
+     * @param epochId Epoch identifier
+     * @return submitted Whether decision was submitted
+     * @return timestamp When decision was submitted
+     */
+    function getEpochDecision(uint256 epochId) external view returns (bool submitted, uint256 timestamp) {
+        // This is a simplified implementation
+        // In production, you'd store epoch decisions in a mapping
+        // For now, we'll check if any node was updated in the last epoch duration
+        uint256 epochDuration = 60; // 60 seconds per epoch
+        uint256 epochStart = epochId * epochDuration;
+        uint256 epochEnd = (epochId + 1) * epochDuration;
+        
+        // Check if any node was updated during this epoch
+        for (uint256 i = 0; i < registeredNodes.length; i++) {
+            string memory nodeId = registeredNodes[i];
+            if (nodes[nodeId].lastUpdated >= epochStart && nodes[nodeId].lastUpdated < epochEnd) {
+                return (true, nodes[nodeId].lastUpdated);
+            }
+        }
+        
+        return (false, 0);
+    }
+    
+    // Event for epoch decision submission
+    event EpochDecisionSubmitted(uint256 indexed epochId, uint256 nodeCount);
 }

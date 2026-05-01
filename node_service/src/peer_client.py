@@ -19,7 +19,7 @@ import uuid
 
 # Import signed report system (Phase 2)
 try:
-    from monitoring_report import MonitoringReport, NodeSigner, ReportVerifier
+    from src.monitoring_report import MonitoringReport, NodeSigner, ReportVerifier
     REPORT_AVAILABLE = True
 except ImportError:
     REPORT_AVAILABLE = False
@@ -28,7 +28,7 @@ except ImportError:
 
 # Import epoch manager for decision handling
 try:
-    from epoch_manager import get_epoch_manager
+    from src.epoch_manager import get_epoch_manager
     EPOCH_MANAGER_AVAILABLE = True
 except ImportError:
     EPOCH_MANAGER_AVAILABLE = False

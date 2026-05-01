@@ -462,18 +462,29 @@ class WebsiteMonitor:
             else:
                 processed_results.append(result)
         
-        success_count = sum(1 for r in processed_results if r.get('status') == 'success')
+        # Convert MonitoringReport objects to dicts for processing
+        final_results = []
+        for r in processed_results:
+            if hasattr(r, '__dataclass_fields__'):
+                final_results.append({
+                    'url': getattr(r, 'url', 'unknown'),
+                    'status': 'success' if getattr(r, 'is_reachable', False) else 'error'
+                })
+            else:
+                final_results.append(r)
+
+        success_count = sum(1 for r in final_results if r.get('status') == 'success')
         logger.info(f"Monitoring completed: {success_count}/{len(urls)} successful")
-        
-        return processed_results
+
+        return final_results
     
-    def extract_monitoring_features(self, results: List[Dict]) -> Dict:
+    def extract_monitoring_features(self, results: List) -> Dict:
         """
         Extract features for ML model from monitoring results
-        
+
         Args:
-            results: List of monitoring results
-            
+            results: List of monitoring results (dicts or MonitoringReport objects)
+
         Returns:
             Dictionary with extracted features
         """
@@ -485,16 +496,36 @@ class WebsiteMonitor:
                 'stale_report_rate': 0,
                 'false_report_rate': 0
             }
-        
+
+        # Convert MonitoringReport objects to dicts if needed
+        converted_results = []
+        for r in results:
+            if hasattr(r, '__dataclass_fields__'):
+                # It's a MonitoringReport dataclass, convert to dict
+                converted_results.append({
+                    'url': getattr(r, 'url', 'unknown'),
+                    'response_time_ms': getattr(r, 'response_ms', -1),
+                    'http_status': getattr(r, 'status_code', 0),
+                    'ssl_valid': getattr(r, 'ssl_valid', False),
+                    'content_hash': getattr(r, 'content_hash', ''),
+                    'is_reachable': getattr(r, 'is_reachable', False),
+                    'status': 'success' if getattr(r, 'is_reachable', False) else 'error'
+                })
+            else:
+                # It's already a dict
+                converted_results.append(r)
+
+        results = converted_results
+
         # Calculate average response time
         response_times = [r.get('response_time_ms', 0) for r in results if r.get('response_time_ms')]
         avg_response_ms = sum(response_times) / len(response_times) if response_times else 0
-        
+
         # Calculate SSL valid rate
         ssl_checks = [r for r in results if 'ssl_valid' in r]
         ssl_valid_count = sum(1 for r in ssl_checks if r.get('ssl_valid') is True)
         ssl_valid_rate = ssl_valid_count / len(ssl_checks) if ssl_checks else 1.0
-        
+
         # Calculate content match rate (simplified - in real system would compare with peers)
         content_hashes = [r.get('content_hash') for r in results if r.get('content_hash')]
         if len(content_hashes) > 1:

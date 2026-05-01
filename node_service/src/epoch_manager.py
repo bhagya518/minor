@@ -22,14 +22,20 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 import pandas as pd
 import numpy as np
-import sqlite3
+try:
+    import aiosqlite
+    SQLITE_AVAILABLE = True
+except ImportError:
+    import sqlite3
+    SQLITE_AVAILABLE = False
+    aiosqlite = None
 import json
 import os
 import hashlib
 
 # Import signature verification
 try:
-    from monitoring_report import ReportVerifier
+    from src.monitoring_report import ReportVerifier
     VERIFIER_AVAILABLE = True
 except ImportError:
     VERIFIER_AVAILABLE = False
@@ -68,18 +74,18 @@ class EpochManager:
         self.current_leader = None
         self.is_leader = False
         self.leader_history = {}  # epoch_id -> leader_id
+        self.leader_rotation_interval = 10  # Rotate leader every 10 epochs
         
         # Persistence
         self.db_path = os.path.join(os.path.dirname(__file__), '..', 'epoch_data.db')
-        self._init_database()
+        # Initialize database synchronously (no event loop in __init__)
+        self._init_database_sync()
     
-    def _init_database(self):
-        """Initialize SQLite database for persistence"""
+    def _init_database_sync(self):
+        """Synchronous database initialization for __init__"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
-            # Create reports table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS reports (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,8 +96,6 @@ class EpochManager:
                     timestamp REAL NOT NULL
                 )
             ''')
-            
-            # Create decisions table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,8 +104,6 @@ class EpochManager:
                     timestamp REAL NOT NULL
                 )
             ''')
-            
-            # Create slash_history table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS slash_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,59 +113,154 @@ class EpochManager:
                     timestamp REAL NOT NULL
                 )
             ''')
-            
             conn.commit()
             conn.close()
-            logger.info(f"Database initialized at {self.db_path}")
+            logger.info(f"Database initialized at {self.db_path} (sync)")
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
     
-    def _save_report(self, epoch_id: int, report: Dict, is_own: bool = False):
-        """Save a report to the database"""
+    async def _init_database(self):
+        """Initialize SQLite database for persistence using async aiosqlite"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            node_id = report.get("node_address", report.get("node_id", "unknown"))
-            cursor.execute('''
-                INSERT INTO reports (epoch_id, node_id, report_data, is_own, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (epoch_id, node_id, json.dumps(report), is_own, time.time()))
-            
-            conn.commit()
-            conn.close()
+            if SQLITE_AVAILABLE:
+                async with aiosqlite.connect(self.db_path) as conn:
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS reports (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            epoch_id INTEGER NOT NULL,
+                            node_id TEXT NOT NULL,
+                            report_data TEXT NOT NULL,
+                            is_own BOOLEAN DEFAULT 0,
+                            timestamp REAL NOT NULL
+                        )
+                    ''')
+                    
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS decisions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            epoch_id INTEGER NOT NULL UNIQUE,
+                            decision_data TEXT NOT NULL,
+                            timestamp REAL NOT NULL
+                        )
+                    ''')
+                    
+                    await conn.execute('''
+                        CREATE TABLE IF NOT EXISTS slash_history (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            epoch_id INTEGER NOT NULL,
+                            node_id TEXT NOT NULL,
+                            reason TEXT NOT NULL,
+                            timestamp REAL NOT NULL
+                        )
+                    ''')
+                    
+                    await conn.commit()
+                logger.info(f"Database initialized at {self.db_path} (async)")
+            else:
+                # Fallback to synchronous sqlite3
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS reports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        epoch_id INTEGER NOT NULL,
+                        node_id TEXT NOT NULL,
+                        report_data TEXT NOT NULL,
+                        is_own BOOLEAN DEFAULT 0,
+                        timestamp REAL NOT NULL
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS decisions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        epoch_id INTEGER NOT NULL UNIQUE,
+                        decision_data TEXT NOT NULL,
+                        timestamp REAL NOT NULL
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS slash_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        epoch_id INTEGER NOT NULL,
+                        node_id TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        timestamp REAL NOT NULL
+                    )
+                ''')
+                conn.commit()
+                conn.close()
+                logger.warning(f"Database initialized at {self.db_path} (sync fallback)")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+    
+    async def _save_report(self, epoch_id: int, report: Dict, is_own: bool = False):
+        """Save a report to the database using async aiosqlite"""
+        try:
+            if SQLITE_AVAILABLE:
+                async with aiosqlite.connect(self.db_path) as conn:
+                    node_id = report.get("node_address", report.get("node_id", "unknown"))
+                    await conn.execute('''
+                        INSERT INTO reports (epoch_id, node_id, report_data, is_own, timestamp)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (epoch_id, node_id, json.dumps(report), is_own, time.time()))
+                    await conn.commit()
+            else:
+                # Fallback to synchronous
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                node_id = report.get("node_address", report.get("node_id", "unknown"))
+                cursor.execute('''
+                    INSERT INTO reports (epoch_id, node_id, report_data, is_own, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (epoch_id, node_id, json.dumps(report), is_own, time.time()))
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.error(f"Failed to save report: {e}")
     
-    def _save_decision(self, epoch_id: int, decision: Dict):
-        """Save an epoch decision to the database"""
+    async def _save_decision(self, epoch_id: int, decision: Dict):
+        """Save an epoch decision to the database using async aiosqlite"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO decisions (epoch_id, decision_data, timestamp)
-                VALUES (?, ?, ?)
-            ''', (epoch_id, json.dumps(decision), time.time()))
-            
-            conn.commit()
-            conn.close()
+            if SQLITE_AVAILABLE:
+                async with aiosqlite.connect(self.db_path) as conn:
+                    await conn.execute('''
+                        INSERT OR REPLACE INTO decisions (epoch_id, decision_data, timestamp)
+                        VALUES (?, ?, ?)
+                    ''', (epoch_id, json.dumps(decision), time.time()))
+                    await conn.commit()
+            else:
+                # Fallback to synchronous
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO decisions (epoch_id, decision_data, timestamp)
+                    VALUES (?, ?, ?)
+                ''', (epoch_id, json.dumps(decision), time.time()))
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.error(f"Failed to save decision: {e}")
     
-    def _save_slash_event(self, epoch_id: int, node_id: str, reason: str):
-        """Save a slash event to the database"""
+    async def _save_slash_event(self, epoch_id: int, node_id: str, reason: str):
+        """Save a slash event to the database using async aiosqlite"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO slash_history (epoch_id, node_id, reason, timestamp)
-                VALUES (?, ?, ?, ?)
-            ''', (epoch_id, node_id, reason, time.time()))
-            
-            conn.commit()
-            conn.close()
+            if SQLITE_AVAILABLE:
+                async with aiosqlite.connect(self.db_path) as conn:
+                    await conn.execute('''
+                        INSERT INTO slash_history (epoch_id, node_id, reason, timestamp)
+                        VALUES (?, ?, ?, ?)
+                    ''', (epoch_id, node_id, reason, time.time()))
+                    await conn.commit()
+            else:
+                # Fallback to synchronous
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO slash_history (epoch_id, node_id, reason, timestamp)
+                    VALUES (?, ?, ?, ?)
+                ''', (epoch_id, node_id, reason, time.time()))
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.error(f"Failed to save slash event: {e}")
     
@@ -244,8 +341,87 @@ class EpochManager:
             return []
         
     def get_current_epoch(self) -> int:
-        """Get current epoch based on time"""
+        """Get current epoch number"""
         return int(time.time() // self.epoch_duration)
+    
+    def _elect_leader(self, epoch_id: int) -> str:
+        """
+        Elect leader for given epoch based on reputation scores
+        Highest reputation node becomes leader (ties broken by deterministic hash)
+        
+        Args:
+            epoch_id: Epoch identifier
+            
+        Returns:
+            Selected leader node_id
+        """
+        # Get all known nodes with their reputation scores
+        node_reputations = {}
+        
+        # Add self with current reputation
+        self_reputation = self.ewma_reputations.get(self.node_id, 0.5)
+        node_reputations[self.node_id] = self_reputation
+        
+        # Add nodes from recent reports with their reputations
+        recent_epoch = epoch_id - 1
+        if recent_epoch in self.epoch_reports:
+            for report in self.epoch_reports[recent_epoch]:
+                node_id = report.get("node_address", report.get("node_id"))
+                if node_id and node_id not in node_reputations:
+                    # Get reputation from ML consensus engine or default
+                    reputation = 0.5  # Default reputation
+                    if self.ml_consensus_engine:
+                        reputation = self.ml_consensus_engine.ewma_reputations.get(node_id, 0.5)
+                    node_reputations[node_id] = reputation
+        
+        if not node_reputations:
+            return self.node_id
+        
+        # Find node with highest reputation
+        max_reputation = max(node_reputations.values())
+        top_nodes = [node_id for node_id, rep in node_reputations.items() if rep == max_reputation]
+        
+        selected_leader = None
+        
+        if len(top_nodes) == 1:
+            # Clear winner - highest reputation
+            selected_leader = top_nodes[0]
+        else:
+            # Tie breaker: use deterministic hash among top nodes
+            import hashlib
+            sorted_top_nodes = sorted(top_nodes)
+            hash_input = f"{epoch_id}:{len(sorted_top_nodes)}"
+            hash_value = int(hashlib.sha256(hash_input.encode()).hexdigest(), 16)
+            leader_index = hash_value % len(sorted_top_nodes)
+            selected_leader = sorted_top_nodes[leader_index]
+        
+        # Update leader state
+        self.current_leader = selected_leader
+        self.is_leader = (selected_leader == self.node_id)
+        self.leader_history[epoch_id] = selected_leader
+        
+        # Log reputation-based election
+        logger.info(f"Epoch {epoch_id}: Reputation-based leader election")
+        logger.info(f"  Selected leader: {selected_leader} (reputation: {node_reputations[selected_leader]:.3f})")
+        logger.info(f"  Is this node leader: {self.is_leader}")
+        
+        # Log top 3 nodes for transparency
+        sorted_nodes = sorted(node_reputations.items(), key=lambda x: x[1], reverse=True)
+        logger.info(f"  Top reputations: {sorted_nodes[:3]}")
+        
+        return selected_leader
+    
+    def _should_rotate_leader(self, epoch_id: int) -> bool:
+        """
+        Check if leader should rotate based on rotation interval
+        
+        Args:
+            epoch_id: Current epoch
+            
+        Returns:
+            True if leader should rotate
+        """
+        return epoch_id % self.leader_rotation_interval == 0
     
     def _elect_leader(self, epoch_id: int, peer_nodes: List[str]) -> str:
         """
@@ -340,7 +516,7 @@ class EpochManager:
             logger.error(f"Error verifying report signature: {e}")
             return False
     
-    def add_report(self, report: Dict, is_own: bool = False):
+    async def add_report(self, report: Dict, is_own: bool = False) -> bool:
         """
         Add a report to the current epoch with signature verification and persistence
         
@@ -362,7 +538,7 @@ class EpochManager:
             self.epoch_reports[epoch_id].append(report)
         
         # Persist report to database
-        self._save_report(epoch_id, report, is_own)
+        await self._save_report(epoch_id, report, is_own)
         
         logger.debug(f"Added report for epoch {epoch_id} (own={is_own}), total peer reports: {len(self.epoch_reports[epoch_id])}")
         return True
@@ -404,7 +580,10 @@ class EpochManager:
         """
         logger.info(f"Processing epoch {epoch_id}")
         
-        # Collect all reports for this epoch
+        # Step 1: Elect leader for this epoch
+        leader = self._elect_leader(epoch_id)
+        
+        # Step 2: Collect all reports for this epoch
         peer_reports = self.epoch_reports.get(epoch_id, [])
         own_report = self.own_reports.get(epoch_id)
         
@@ -412,11 +591,32 @@ class EpochManager:
         if own_report:
             all_reports.append(own_report)
         
+        # Step 3: Filter reports based on shard participation restrictions
+        if self.ml_consensus_engine:
+            filtered_reports = []
+            for report in all_reports:
+                node_id = report.get("node_address", report.get("node_id"))
+                if node_id:
+                    # Get node's current shard
+                    if node_id in self.ml_consensus_engine.mitigation_actions:
+                        action = self.ml_consensus_engine.mitigation_actions[node_id]
+                        # Allow participation based on shard
+                        if action.shard in ['PRIMARY', 'MONITORING']:
+                            filtered_reports.append(report)
+                        elif action.shard == 'QUARANTINE':
+                            # QUARANTINE nodes can submit reports but don't vote
+                            filtered_reports.append(report)  # Keep for monitoring
+                        # SLASHED nodes are completely excluded
+                    else:
+                        # Unknown node, allow by default
+                        filtered_reports.append(report)
+            all_reports = filtered_reports
+        
         # Get peer nodes for leader election (from reports)
         peer_nodes = []
         for report in peer_reports:
-            node_id = report.get("node_address", report.get("node_id", "unknown"))
-            if node_id != "unknown" and node_id != self.node_id:
+            node_id = report.get("node_address", report.get("node_id"))
+            if node_id and node_id != self.node_id:
                 peer_nodes.append(node_id)
         
         # Check if this node is the leader for this epoch
@@ -562,26 +762,35 @@ class EpochManager:
 
         if weighted_malicious >= consensus_threshold and malicious_votes >= quorum:
             malicious_nodes = [nid for nid, v in node_verdicts.items() if v == "malicious"]
-            for node_id in malicious_nodes:
+            if malicious_nodes and self.blockchain_client:
                 try:
-                    if self.blockchain_client:
-                        slash_result = await self.blockchain_client.slash_node(
-                            node_id,
-                            amount=0.1,  # Slash 10% reputation
-                            reason=f"Epoch {epoch_id} consensus: {malicious_votes}/{total_votes} nodes voted malicious",
-                        )
-                        logger.warning(f"Epoch {epoch_id}: SLASHED node {node_id} - {slash_result}")
-
-                    self.slash_history.append({
-                        "epoch": epoch_id,
-                        "node_id": node_id,
-                        "reason": f"Consensus: {malicious_votes}/{total_votes} malicious votes",
-                        "timestamp": time.time(),
-                    })
-                    # Persist slash event to database
-                    self._save_slash_event(epoch_id, node_id, f"Consensus: {malicious_votes}/{total_votes} malicious votes")
+                    # Use batch slashing for efficiency (1 transaction instead of N)
+                    node_ids = malicious_nodes
+                    amounts = [0.1] * len(malicious_nodes)  # 10% slash each
+                    reason = f"Epoch {epoch_id} consensus: {malicious_votes}/{total_votes} nodes voted malicious"
+                    
+                    batch_result = await self.blockchain_client.batch_slash_nodes(
+                        node_ids=node_ids,
+                        amounts=amounts,
+                        reason=reason,
+                        epoch_id=epoch_id
+                    )
+                    
+                    if batch_result['success']:
+                        logger.warning(f"Epoch {epoch_id}: Batch slashed {len(malicious_nodes)} nodes")
+                    else:
+                        # Fallback to individual slashing
+                        logger.error(f"Batch slashing failed, trying individual slashes")
+                        for node_id in malicious_nodes:
+                            slash_result = await self.blockchain_client.slash_node(
+                                node_id=node_id,
+                                amount=0.1,
+                                reason=reason,
+                                epoch_id=epoch_id
+                            )
+                            logger.warning(f"Epoch {epoch_id}: SLASHED node {node_id} - {slash_result}")
                 except Exception as e:
-                    logger.error(f"Epoch {epoch_id}: error slashing node {node_id}: {e}")
+                    logger.error(f"Epoch {epoch_id}: Error during slashing: {e}")
         else:
             logger.info(f"Epoch {epoch_id}: no malicious quorum (need {quorum}, got {malicious_votes})")
         
@@ -625,29 +834,33 @@ class EpochManager:
                 'evidence': f"Epoch {epoch_id} verdict: {verdict} (penalty: {penalty})"
             })
         
-        # BATCHED BLOCKCHAIN UPDATES: Send all reputation updates in batches
-        # This reduces transactions from O(n) to O(1) per epoch
-        if reputation_updates and self.blockchain_client:
+        # BLOCKCHAIN FINALITY: Leader submits epoch decision to blockchain
+        # This makes blockchain the source of truth for consensus
+        if self.is_leader and self.blockchain_client:
             try:
-                logger.info(f"Epoch {epoch_id}: Batching {len(reputation_updates)} reputation updates")
+                logger.info(f"Epoch {epoch_id}: Leader submitting decision to blockchain (source of truth)")
                 
-                # Send batch update (if blockchain client supports it)
-                # Otherwise fall back to individual updates
-                if hasattr(self.blockchain_client, 'batch_update_reputation'):
-                    await self.blockchain_client.batch_update_reputation(reputation_updates)
+                # Submit epoch decision to blockchain
+                blockchain_result = await self.blockchain_client.submit_epoch_decision(epoch_id, decision)
+                
+                if blockchain_result['success']:
+                    logger.info(f"Epoch {epoch_id}: Decision committed to blockchain - consensus finalized")
+                    decision['blockchain_committed'] = True
+                    decision['blockchain_tx'] = blockchain_result.get('tx_hash')
                 else:
-                    # Fallback: send individual updates sequentially
-                    for update in reputation_updates:
-                        await self.blockchain_client.update_reputation(
-                            update['node_id'],
-                            update['new_por'],
-                            update['new_por'],
-                            evidence=update['evidence']
-                        )
-                
-                logger.info(f"Epoch {epoch_id}: Successfully batched {len(reputation_updates)} reputation updates")
+                    logger.warning(f"Epoch {epoch_id}: Failed to commit to blockchain: {blockchain_result.get('error')}")
+                    decision['blockchain_committed'] = False
             except Exception as e:
-                logger.error(f"Epoch {epoch_id}: error batching reputation updates: {e}")
+                logger.error(f"Epoch {epoch_id}: Error submitting to blockchain: {e}")
+                decision['blockchain_committed'] = False
+        else:
+            # Non-leader nodes verify decision from blockchain
+            if self.blockchain_client:
+                logger.info(f"Epoch {epoch_id}: Non-leader - will verify decision from blockchain")
+                decision['blockchain_committed'] = None  # Pending verification
+            else:
+                logger.warning(f"Epoch {epoch_id}: No blockchain client - decision is local only")
+                decision['blockchain_committed'] = False
         
         # Step 7: Store epoch decision with WEIGHTED voting results
         decision = {
@@ -662,12 +875,14 @@ class EpochManager:
             "node_verdicts": node_verdicts,
             "node_weights": node_weights,
             "consensus_results": consensus_results,
-            "voting_type": "reputation_weighted"
+            "voting_type": "reputation_weighted",
+            "blockchain_committed": False,  # Will be set by blockchain commit
+            "blockchain_tx": None
         }
         self.epoch_decisions[epoch_id] = decision
         
         # Persist decision to database
-        self._save_decision(epoch_id, decision)
+        await self._save_decision(epoch_id, decision)
         
         # Step 9: Broadcast final decision to all peers (leader only)
         if self.blockchain_client and hasattr(self.blockchain_client, 'peer_client'):

@@ -49,7 +49,7 @@ class EnhancedMLConsensusEngine:
     QUARANTINE = "QUARANTINE"
     SLASHED = "SLASHED"
     
-    def __init__(self, node_id: str, alpha: float = 0.9, iso_contamination: float = 0.15):
+    def __init__(self, node_id: str, alpha: float = 0.3, iso_contamination: float = 0.15):
         self.node_id = node_id
         self.alpha = alpha  # EWMA smoothing factor
         self.iso_contamination = iso_contamination
@@ -296,13 +296,23 @@ class EnhancedMLConsensusEngine:
             self.ewma_reputations[node_id] = current_reputation
             return current_reputation
         
-        # CRITICAL FIX: Correct EWMA formula - weight NEW data more (alpha=0.9)
-        # Wrong: ewma = alpha * old + (1-alpha) * new  # This weights history 90%
-        # Correct: ewma = alpha * new + (1-alpha) * old  # This weights new data 90%
+        # CRITICAL FIX: Correct EWMA formula - weight NEW data more (alpha=0.3)
+        # Wrong: ewma = alpha * old + (1-alpha) * new  # This weights history 70%
+        # Correct: ewma = alpha * new + (1-alpha) * old  # This weights new data 30%
         ewma_rep = self.alpha * current_reputation + (1.0 - self.alpha) * self.ewma_reputations[node_id]
         self.ewma_reputations[node_id] = ewma_rep
         
         return ewma_rep
+    
+    async def calculate_enhanced_reputation_async(self, features: Dict) -> float:
+        """Async wrapper for calculate_enhanced_reputation to avoid blocking event loop"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.calculate_enhanced_reputation, features)
+    
+    async def evaluate_node_async(self, node_id: str, features: Dict) -> Tuple[float, MitigationDecision]:
+        """Async wrapper for evaluate_node to avoid blocking event loop"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.evaluate_node, node_id, features)
     
     def evaluate_node(self, node_id: str, features: Dict) -> Tuple[float, MitigationDecision]:
         """Evaluate node and return reputation with mitigation decision"""

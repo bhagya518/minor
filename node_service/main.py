@@ -65,9 +65,9 @@ except ImportError as e:
 
 # Import monitoring components
 try:
-    from website_monitor import WebsiteMonitor, MonitoringScheduler, set_node_id, set_node_mode, NODE_SIGNER
-    from trust_engine import TrustEngine, TrustCalculator
-    from peer_client import PeerClient
+    from src.website_monitor import WebsiteMonitor, MonitoringScheduler, set_node_id, set_node_mode, NODE_SIGNER
+    from src.trust_engine import TrustEngine, TrustCalculator
+    from src.peer_client import PeerClient
     from src.epoch_manager import init_epoch_manager, get_epoch_manager
     monitoring_available = True
     logger.info("Monitoring components imported successfully")
@@ -146,6 +146,10 @@ except Exception as e:
 # Verdict storage for /verdict endpoint
 verdicts_store: Dict[str, dict] = {}
 
+# Blockchain write queue for non-blocking updates
+blockchain_write_queue = None
+blockchain_write_task = None
+
 # Background tasks
 monitoring_task = None
 heartbeat_task = None
@@ -156,7 +160,7 @@ async def startup_event():
     """Initialize node components on startup"""
     global website_monitor, monitoring_scheduler, trust_engine, peer_client, ml_classifier
     global blockchain_client, live_ml, ml_consensus, node_config, epoch_manager
-    global monitoring_task, heartbeat_task, cleanup_task
+    global monitoring_task, heartbeat_task, cleanup_task, blockchain_write_queue, blockchain_write_task
 
     # Parse command line arguments at startup (needed for --peers flag)
     args = parser.parse_args()
@@ -230,15 +234,8 @@ async def startup_event():
             peer_client.set_node_signer(NODE_SIGNER)
             logger.info("Node signer configured for P2P message authentication")
         
-        # Initialize enhanced ML integration
-        try:
-            from src.live_ml_integration import LiveMLIntegration
-            global live_ml
-            live_ml = LiveMLIntegration(node_config.node_id)
-            logger.info("Live ML integration initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize live ML integration: {e}")
-            live_ml = None
+        # Initialize enhanced ML integration (live_ml_integration not available - using ml_consensus instead)
+        live_ml = None
         
         # Initialize Enhanced ML Consensus Engine
         if ML_AVAILABLE:
@@ -310,11 +307,12 @@ async def startup_event():
                     logger.info(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
         
-        # Exit if blockchain is not available after all retries
+        # Blockchain is optional - node can start without it for graceful degradation
         if not blockchain_available:
-            logger.error("❌ BLOCKCHAIN NOT AVAILABLE - Node cannot start without blockchain")
-            logger.error("Please start the blockchain (Hardhat) first: cd blockchain && npx hardhat node")
-            raise SystemExit("Blockchain not available. Node startup aborted.")
+            logger.warning("⚠️ BLOCKCHAIN NOT AVAILABLE - Node will start in DEGRADED mode")
+            logger.warning("Blockchain features (reputation on-chain, slashing) will be disabled")
+            logger.warning("Monitoring and consensus will continue to work locally")
+            blockchain_client = None  # Ensure it's None for checks elsewhere
         
         # Register node on blockchain
         if blockchain_client:
@@ -345,6 +343,11 @@ async def startup_event():
         
         # Start cleanup task
         cleanup_task = asyncio.create_task(cleanup_loop())
+        
+        # Initialize blockchain write queue for non-blocking updates
+        blockchain_write_queue = asyncio.Queue()
+        blockchain_write_task = asyncio.create_task(blockchain_write_processor())
+        logger.info("Blockchain write queue initialized")
         
         # Start epoch manager background task (Phase 3)
         if epoch_manager:
@@ -427,10 +430,50 @@ async def cleanup_loop():
         try:
             if trust_engine:
                 trust_engine.cleanup_old_data()
+            
+            # Prune peer_reports - keep only current + previous epoch
+            global peer_reports
+            current_epoch = int(__import__('time').time() // 60)
+            peer_reports = [r for r in peer_reports 
+                          if r.get("epoch_id", 0) >= current_epoch - 1]
+            logger.debug(f"Pruned peer_reports to {len(peer_reports)} entries")
+            
             await asyncio.sleep(3600)  # Cleanup every hour
         except Exception as e:
             logger.error(f"Error in cleanup loop: {e}")
             await asyncio.sleep(3600)
+
+async def blockchain_write_processor():
+    """Process blockchain writes from queue in background"""
+    global blockchain_write_queue
+    logger.info("Blockchain write processor started")
+    
+    while True:
+        try:
+            if blockchain_write_queue and not blockchain_write_queue.empty():
+                # Get write request from queue
+                write_request = await blockchain_write_queue.get()
+                
+                if write_request and blockchain_client:
+                    try:
+                        result = blockchain_client.update_reputation(
+                            write_request['node_id'],
+                            write_request['trust_score'],
+                            write_request['ml_score']
+                        )
+                        if result['success']:
+                            logger.debug(f"Blockchain write completed for {write_request['node_id']}")
+                        else:
+                            logger.warning(f"Blockchain write failed: {result.get('error')}")
+                    except Exception as e:
+                        logger.error(f"Error processing blockchain write: {e}")
+                
+                blockchain_write_queue.task_done()
+            else:
+                await asyncio.sleep(0.1)  # Small sleep to prevent busy loop
+        except Exception as e:
+            logger.error(f"Error in blockchain write processor: {e}")
+            await asyncio.sleep(1)
 
 async def run_consensus_and_slash():
     """
@@ -573,10 +616,10 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
 
 async def process_monitoring_results():
     """Process monitoring results with live ML integration"""
-    
+
     if not monitoring_scheduler:
         return
-    
+
     try:
         # Get latest monitoring results
         results = monitoring_scheduler.get_latest_results(10)
@@ -587,33 +630,48 @@ async def process_monitoring_results():
         enhanced_results = []
         # Only process the single newest result each cycle
         for result in [results[-1]]:
+            # Convert MonitoringReport to dict if it's a dataclass
+            if hasattr(result, '__dataclass_fields__'):
+                result_dict = {
+                    'url': getattr(result, 'url', 'unknown'),
+                    'response_ms': getattr(result, 'response_ms', -1),
+                    'status_code': getattr(result, 'status_code', 0),
+                    'ssl_valid': getattr(result, 'ssl_valid', False),
+                    'content_hash': getattr(result, 'content_hash', ''),
+                    'is_reachable': getattr(result, 'is_reachable', False),
+                    'node_address': getattr(result, 'node_address', ''),
+                    'timestamp': getattr(result, 'timestamp', 0)
+                }
+            else:
+                result_dict = result
+
             if live_ml:
                 # Use enhanced ML integration
-                enhanced_result = live_ml.process_monitoring_result(result)
+                enhanced_result = live_ml.process_monitoring_result(result_dict)
                 enhanced_results.append(enhanced_result)
-                
-                logger.info(f"Live ML processed: {result.get('url', 'unknown')} -> "
+
+                logger.info(f"Live ML processed: {result_dict.get('url', 'unknown')} -> "
                            f"{enhanced_result.get('ml_prediction', 'unknown')} "
                            f"(score: {enhanced_result.get('ml_score', 0.0):.3f})")
             else:
                 # Fallback to basic processing
                 enhanced_results.append({
-                    **result,
+                    **result_dict,
                     'ml_processed': False,
                     'ml_prediction': 'unknown',
                     'ml_score': 0.5
                 })
-        
+
         # Update trust engine with enhanced results
         if trust_engine:
             for result in enhanced_results:
                 trust_engine.add_monitoring_report(node_config.node_id, result)
-            
+
             # Calculate trust score
             trust_score = trust_engine.calculate_monitoring_trust(node_config.node_id)
         else:
             trust_score = 0.8  # Default trust
-        
+
         # Get ML score from live integration
         if enhanced_results:
             latest_result = enhanced_results[-1]
@@ -628,20 +686,9 @@ async def process_monitoring_results():
         
         logger.info(f"Trust: {trust_score:.4f}, ML: {ml_score:.4f}, PoR: {por_score:.4f}")
         
-        # Update blockchain
-        if blockchain_client:
-            try:
-                result = blockchain_client.update_reputation(
-                    node_config.node_id,
-                    trust_score,
-                    ml_score
-                )
-                if result['success']:
-                    logger.info("Reputation updated on blockchain")
-                else:
-                    logger.warning(f"Failed to update reputation: {result.get('error')}")
-            except Exception as e:
-                logger.error(f"Error updating blockchain: {e}")
+        # REMOVED: Per-node blockchain writes
+        # Blockchain writes now handled by epoch_manager leader only (batch per epoch)
+        # This reduces blockchain transactions from O(n) to O(1) per epoch
         
         # Send trust update to peers
         if peer_client:
@@ -689,16 +736,7 @@ async def process_monitoring_results():
                 # FIX: also store own report in peer_reports so /reports/latest works
                 peer_reports.append(asdict(signed_report))
                 
-                # Run majority-vote consensus and store verdict
-                from website_monitor import get_current_epoch
-                current_epoch = int(__import__('time').time() // 60)
-                epoch_reports_now = [r for r in peer_reports 
-                                     if r.get("epoch_id") == current_epoch]
-                if epoch_reports_now:
-                    verdict = run_consensus_vote(current_epoch, epoch_reports_now)
-                    verdicts_store[str(current_epoch)] = verdict
-                
-                # Add own report to epoch_manager for Phase 3 consensus
+                # Add own report to epoch_manager for Phase 3 consensus (reputation-weighted)
                 if epoch_manager:
                     epoch_manager.add_report(asdict(signed_report), is_own=True)
                     logger.info(f"Added own report to epoch_manager for epoch {signed_report.epoch_id}")

@@ -161,13 +161,13 @@ class BlockchainClient:
     def _send_transaction(self, function_call, value: int = 0) -> Dict:
         """Send transaction to blockchain"""
         try:
-            # Build transaction
+            # Build transaction - use pending nonce to handle multiple transactions from same account
             transaction = function_call.build_transaction({
                 'from': self.account.address,
                 'value': value,
                 'gas': self.config['gas_limit'],
                 'gasPrice': self.w3.to_wei(self.config['gas_price_gwei'], 'gwei'),
-                'nonce': self.w3.eth.get_transaction_count(self.account.address),
+                'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
                 'chainId': self.config['chain_id']
             })
             
@@ -240,7 +240,7 @@ class BlockchainClient:
                 'error': str(e)
             }
     
-    def update_reputation(self, node_id: str, monitoring_trust: float, ml_score: float) -> Dict:
+    def update_reputation(self, node_id: str, monitoring_trust: float, ml_score: float, evidence: str = "") -> Dict:
         """
         Update node reputation on blockchain
         
@@ -248,6 +248,7 @@ class BlockchainClient:
             node_id: Node identifier
             monitoring_trust: Monitoring trust score (0-1)
             ml_score: ML confidence score (0-1)
+            evidence: Optional evidence string for the update
             
         Returns:
             Transaction result
@@ -274,6 +275,336 @@ class BlockchainClient:
             
         except Exception as e:
             logger.error(f"Failed to update reputation for node {node_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def batch_update_reputation(self, updates: List[Dict]) -> Dict:
+        """
+        Batch update multiple node reputations in a single transaction
+        This reduces blockchain transactions from O(n) to O(1) per epoch
+        
+        Args:
+            updates: List of dicts with keys: node_id, new_por, evidence
+            
+        Returns:
+            Transaction result
+        """
+        try:
+            logger.info(f"Batch updating {len(updates)} reputation updates")
+            
+            # If contract supports batch updates, use it
+            if hasattr(self.contract.functions, 'batchUpdateReputation'):
+                # Prepare batch data
+                node_ids = [u['node_id'] for u in updates]
+                por_scores = [int(u['new_por'] * 1000) for u in updates]
+                
+                function_call = self.contract.functions.batchUpdateReputation(node_ids, por_scores)
+                result = self._send_transaction(function_call)
+                
+                if result['success']:
+                    logger.info(f"Batch reputation update completed for {len(updates)} nodes")
+                
+                return result
+            else:
+                # Fallback: sequential updates (still better than per-monitoring-cycle)
+                results = []
+                for update in updates:
+                    result = self.update_reputation(
+                        update['node_id'],
+                        update['new_por'],
+                        update['new_por'],
+                        evidence=update.get('evidence', '')
+                    )
+                    results.append(result)
+                
+                success_count = sum(1 for r in results if r.get('success'))
+                logger.info(f"Batch update completed: {success_count}/{len(updates)} successful")
+                
+                return {
+                    'success': success_count == len(updates),
+                    'total': len(updates),
+                    'successful': success_count,
+                    'results': results
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to batch update reputations: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def submit_epoch_decision(self, epoch_id: int, decision: Dict) -> Dict:
+        """
+        Submit final epoch decision to blockchain
+        Only leader should call this - this makes blockchain the source of truth
+        
+        Args:
+            epoch_id: Epoch identifier
+            decision: Epoch decision dictionary with verdicts and reputations
+            
+        Returns:
+            Transaction result
+        """
+        try:
+            logger.info(f"Submitting epoch {epoch_id} decision to blockchain")
+            
+            # Extract key decision data
+            node_verdicts = decision.get('node_verdicts', {})
+            node_weights = decision.get('node_weights', {})
+            
+            # Prepare blockchain-compatible data
+            node_ids = list(node_verdicts.keys())
+            verdicts = [1 if node_verdicts[nid] == 'malicious' else 0 for nid in node_ids]
+            reputations = [int(node_weights.get(nid, 0.5) * 1000) for nid in node_ids]
+            
+            # Use contract's submitEpochDecision function
+            function_call = self.contract.functions.submitEpochDecision(
+                epoch_id,
+                node_ids,
+                verdicts,
+                reputations
+            )
+            result = self._send_transaction(function_call)
+            
+            if result['success']:
+                logger.info(f"Epoch {epoch_id} decision committed to blockchain")
+            
+            return result
+                
+        except Exception as e:
+            logger.error(f"Failed to submit epoch decision: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    async def get_epoch_decision(self, epoch_id: int) -> Dict:
+        """
+        Get epoch decision from blockchain for verification
+        
+        Args:
+            epoch_id: Epoch identifier
+            
+        Returns:
+            Epoch decision status
+        """
+        try:
+            # Call getEpochDecision function
+            submitted, timestamp = self.contract.functions.getEpochDecision(epoch_id).call()
+            
+            return {
+                'success': True,
+                'epoch_id': epoch_id,
+                'submitted': submitted,
+                'timestamp': timestamp,
+                'verified': submitted  # Decision is verified if submitted
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get epoch decision {epoch_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def slash_node(self, node_id: str, amount: float, reason: str, epoch_id: int) -> Dict:
+        """
+        Slash a node by reducing its reputation
+        
+        Args:
+            node_id: Node identifier
+            amount: Slash amount as percentage (0.1 = 10%)
+            reason: Reason for slashing
+            epoch_id: Current epoch ID
+            
+        Returns:
+            Transaction result
+        """
+        try:
+            logger.info(f"Slashing node {node_id} by {amount*100}% for: {reason}")
+            
+            # Convert percentage to basis points (10000 = 100%)
+            basis_points = int(amount * 10000)
+            
+            # Call slashNode function
+            function_call = self.contract.functions.slashNode(
+                node_id,
+                basis_points,
+                reason,
+                epoch_id
+            )
+            result = self._send_transaction(function_call)
+            
+            if result['success']:
+                logger.warning(f"Successfully slashed node {node_id} by {amount*100}%")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to slash node {node_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def batch_slash_nodes(self, node_ids: List[str], amounts: List[float], reason: str, epoch_id: int) -> Dict:
+        """
+        Slash multiple nodes in a single transaction
+        
+        Args:
+            node_ids: List of node identifiers
+            amounts: List of slash amounts as percentages
+            reason: Reason for slashing
+            epoch_id: Current epoch ID
+            
+        Returns:
+            Transaction result
+        """
+        try:
+            logger.info(f"Batch slashing {len(node_ids)} nodes")
+            
+            # Convert percentages to basis points
+            basis_points = [int(amount * 10000) for amount in amounts]
+            
+            # Call batchSlashNodes function
+            function_call = self.contract.functions.batchSlashNodes(
+                node_ids,
+                basis_points,
+                reason,
+                epoch_id
+            )
+            result = self._send_transaction(function_call)
+            
+            if result['success']:
+                logger.info(f"Successfully batch slashed {len(node_ids)} nodes")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to batch slash nodes: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def submit_aggregated_report(self, url: str, epoch_id: int, consensus_result: bool, 
+                               honest_votes: int, malicious_votes: int, total_weight: int,
+                               participating_nodes: List[str]) -> Dict:
+        """
+        Submit an aggregated consensus report for an epoch
+        
+        Args:
+            url: The monitored URL
+            epoch_id: Epoch identifier
+            consensus_result: Consensus outcome (True=UP, False=DOWN)
+            honest_votes: Number of honest votes
+            malicious_votes: Number of malicious votes
+            total_weight: Total reputation weight of participants
+            participating_nodes: List of node IDs that participated
+            
+        Returns:
+            Transaction result
+        """
+        try:
+            logger.info(f"Submitting aggregated report for {url}, epoch {epoch_id}")
+            
+            # Call submitAggregatedReport function
+            function_call = self.contract.functions.submitAggregatedReport(
+                url,
+                epoch_id,
+                consensus_result,
+                honest_votes,
+                malicious_votes,
+                total_weight,
+                participating_nodes
+            )
+            result = self._send_transaction(function_call)
+            
+            if result['success']:
+                logger.info(f"Aggregated report submitted for {url}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to submit aggregated report: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def get_node_slash_history(self, node_id: str) -> Dict:
+        """
+        Get slashing history for a specific node
+        
+        Args:
+            node_id: Node identifier
+            
+        Returns:
+            Slashing history
+        """
+        try:
+            # Call getNodeSlashHistory function
+            slash_records = self.contract.functions.getNodeSlashHistory(node_id).call()
+            
+            # Format records
+            history = []
+            for record in slash_records:
+                history.append({
+                    'node_id': record[0],
+                    'amount': record[1] / 10000.0,  # Convert basis points to percentage
+                    'reason': record[2],
+                    'timestamp': record[3],
+                    'epoch_id': record[4]
+                })
+            
+            return {
+                'success': True,
+                'history': history,
+                'total_slashes': len(history)
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get slash history for {node_id}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def get_website_history(self, url: str) -> Dict:
+        """
+        Get consensus history for a website
+        
+        Args:
+            url: Website URL
+            
+        Returns:
+            Website monitoring history
+        """
+        try:
+            # Call getWebsiteHistory function
+            epochs, results = self.contract.functions.getWebsiteHistory(url).call()
+            
+            # Format history
+            history = []
+            for i in range(len(epochs)):
+                history.append({
+                    'epoch_id': epochs[i],
+                    'result': results[i],  # True=UP, False=DOWN
+                    'timestamp': None  # Would need additional call to get timestamp
+                })
+            
+            return {
+                'success': True,
+                'url': url,
+                'history': history,
+                'total_checks': len(history)
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get website history for {url}: {e}")
             return {
                 'success': False,
                 'error': str(e)
