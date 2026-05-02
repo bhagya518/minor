@@ -298,9 +298,10 @@ class BlockchainClient:
             if hasattr(self.contract.functions, 'batchUpdateReputation'):
                 # Prepare batch data
                 node_ids = [u['node_id'] for u in updates]
-                por_scores = [int(u['new_por'] * 1000) for u in updates]
+                monitoring_trusts = [int(u['monitoring_trust'] * 1000) for u in updates]
+                ml_scores = [int(u['ml_score'] * 1000) for u in updates]
                 
-                function_call = self.contract.functions.batchUpdateReputation(node_ids, por_scores)
+                function_call = self.contract.functions.batchUpdateReputation(node_ids, monitoring_trusts, ml_scores)
                 result = self._send_transaction(function_call)
                 
                 if result['success']:

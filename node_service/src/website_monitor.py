@@ -25,7 +25,7 @@ NODE_MODE = os.environ.get('NODE_MODE', 'honest').lower()
 
 def get_current_epoch():
     """Get current epoch ID"""
-    return int(time.time() // 60)  # 1-minute epochs
+    return int(time.time() // 5)  # 5-second epochs
 
 def get_latest_results():
     """Get latest monitoring results (module-level function)"""
@@ -92,7 +92,7 @@ def _build_signed_report(url: str, response_ms: float, status_code: int,
 class WebsiteMonitor:
     """Website monitoring service with comprehensive checks"""
     
-    def __init__(self, timeout: int = 2, max_retries: int = 3):
+    def __init__(self, interval: int = 5, timeout: int = 2, max_retries: int = 3):
         """
         Initialize website monitor
         
@@ -100,6 +100,7 @@ class WebsiteMonitor:
             timeout: Request timeout in seconds
             max_retries: Maximum number of retry attempts
         """
+        self.interval = interval
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.session = None
@@ -171,8 +172,13 @@ class WebsiteMonitor:
             
             # SSL check (if HTTPS)
             if parsed_url.scheme == 'https':
+                # If HTTP request succeeded, SSL is at least functionally valid
+                http_success = results.get('status') == 'success'
                 ssl_result = await self._check_ssl_certificate(parsed_url.netloc)
-                results['ssl_valid'] = ssl_result
+                
+                # Combine results: if either the dedicated check or the HTTP check worked, it's valid
+                # This provides a fallback if open_connection fails but aiohttp works
+                results['ssl_valid'] = ssl_result or http_success
                 results['checks_performed'].append('ssl')
             
             # Content hash calculation
@@ -347,20 +353,32 @@ class WebsiteMonitor:
             context.check_hostname = True
             context.verify_mode = ssl.CERT_REQUIRED
             
-            # Try to establish SSL connection
+            # Try to establish SSL connection with a reasonable timeout
+            # Use a slightly longer timeout for SSL handshake
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(hostname, 443, ssl=context),
-                timeout=self.timeout.total
+                timeout=5.0
             )
             
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
             
             logger.debug(f"SSL certificate valid for {hostname}")
             return True
             
+        except asyncio.TimeoutError:
+            logger.warning(f"SSL certificate check timed out for {hostname}")
+            return False
+        except ssl.SSLCertVerificationError as e:
+            logger.error(f"SSL Verification Error for {hostname}: {e}")
+            return False
         except Exception as e:
             logger.debug(f"SSL certificate check failed for {hostname}: {e}")
+            # If we're here, it might be a connectivity issue or port 443 blocked,
+            # but the HTTP check might have already succeeded.
             return False
     
     def _calculate_content_hash(self, content: str) -> str:
@@ -466,8 +484,14 @@ class WebsiteMonitor:
         final_results = []
         for r in processed_results:
             if hasattr(r, '__dataclass_fields__'):
+                # Preserve all fields from the signed report
                 final_results.append({
                     'url': getattr(r, 'url', 'unknown'),
+                    'response_ms': getattr(r, 'response_ms', -1),
+                    'status_code': getattr(r, 'status_code', 0),
+                    'ssl_valid': getattr(r, 'ssl_valid', False),
+                    'is_reachable': getattr(r, 'is_reachable', False),
+                    'timestamp': getattr(r, 'timestamp', datetime.now().isoformat()),
                     'status': 'success' if getattr(r, 'is_reachable', False) else 'error'
                 })
             else:

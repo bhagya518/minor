@@ -65,10 +65,10 @@ class EpochManager:
         self.slash_history = []  # history of slashing actions
         
         # Configuration
-        self.epoch_duration = 60  # seconds
+        self.epoch_duration = 5  # seconds
         self.min_peers_for_quorum = 1  # need reports from at least 1 other node (reduced for testing)
         self.quorum_threshold = 2/3  # 2/3 majority required
-        self.consensus_timeout = 5  # seconds to wait for quorum before proceeding
+        self.consensus_timeout = 2  # seconds to wait for quorum before proceeding
         
         # Leader election
         self.current_leader = None
@@ -580,9 +580,12 @@ class EpochManager:
         """
         logger.info(f"Processing epoch {epoch_id}")
         
-        # Step 1: Elect leader for this epoch
+        # Step 1: Collect all reports for this epoch
+        own_report = self.own_reports.get(epoch_id)
+        
         # Get peer nodes from reports for leader election
         peer_nodes = set()
+        peer_reports = self.epoch_reports.get(epoch_id, [])
         for report in peer_reports:
             node_id = report.get("node_address", report.get("node_id", ""))
             if node_id:
@@ -592,10 +595,7 @@ class EpochManager:
         
         leader = self._elect_leader(epoch_id, list(peer_nodes))
         
-        # Step 2: Collect all reports for this epoch
-        peer_reports = self.epoch_reports.get(epoch_id, [])
-        own_report = self.own_reports.get(epoch_id)
-        
+        # Step 2: Combine reports
         all_reports = peer_reports.copy()
         if own_report:
             all_reports.append(own_report)
@@ -688,10 +688,8 @@ class EpochManager:
                 # Use sharded consensus if available, otherwise fall back to regular consensus
                 if hasattr(self.ml_consensus_engine, 'process_sharded_consensus'):
                     consensus_results = self.ml_consensus_engine.process_sharded_consensus(epoch_id, all_reports)
-                    logger.info(f"Epoch {epoch_id}: SHARDED ML consensus completed")
                 else:
                     consensus_results = self.ml_consensus_engine.process_epoch_consensus(epoch_id, all_reports)
-                    logger.info(f"Epoch {epoch_id}: ML consensus completed")
             else:
                 # Fallback: simple majority voting without ML
                 consensus_results = self.simple_majority_vote(all_reports)
@@ -726,23 +724,27 @@ class EpochManager:
                         break
             
             if verdict is None:
-                # Fallback: simple heuristic based on report quality
-                is_reachable = report.get("is_reachable", True)
-                ssl_valid = report.get("ssl_valid", True)
-                verdict = "honest" if (is_reachable and ssl_valid) else "malicious"
+                # Optimized Heuristic: Only slash if the report contradicts the majority
+                url = report.get("url")
+                if url in self.epoch_verdicts:
+                    majority_reachable = self.epoch_verdicts[url] == "up"
+                    node_reachable = report.get("is_reachable", True)
+                    # Only malicious if they reported DOWN when majority said UP
+                    verdict = "honest" if node_reachable == majority_reachable else "malicious"
+                else:
+                    verdict = "honest" # Benefit of the doubt if no majority yet
             
             node_verdicts[node_id] = verdict
             
-            # CRITICAL FIX: Get reputation weight for this node
             if consensus_results and "reputations" in consensus_results:
                 # Use ML-calculated reputation as weight
-                reputation = consensus_results["reputations"].get(node_id, 0.5)
+                reputation = consensus_results["reputations"].get(node_id, 0.90)
             elif self.ml_consensus_engine and node_id in self.ml_consensus_engine.reputation:
                 # Fallback to ML engine reputation
-                reputation = self.ml_consensus_engine.reputation.get(node_id, 0.5)
+                reputation = self.ml_consensus_engine.reputation.get(node_id, 0.90)
             else:
                 # Default neutral reputation
-                reputation = 0.5
+                reputation = 0.90
             
             node_weights[node_id] = reputation
             total_weight += reputation
@@ -839,6 +841,7 @@ class EpochManager:
             # This reduces blockchain transactions from O(n) to O(shards)
             reputation_updates.append({
                 'node_id': node_id,
+                'new_por': new_por,
                 'monitoring_trust': new_por,
                 'ml_score': ml_score,
                 'evidence': f"Epoch {epoch_id} verdict: {verdict} (penalty: {penalty})"
@@ -847,7 +850,7 @@ class EpochManager:
         # Step 7: Batch update all node reputations to blockchain
         if reputation_updates and self.blockchain_client:
             try:
-                batch_result = self.blockchain_client.batch_update_reputation(reputation_updates)
+                batch_result = await self.blockchain_client.batch_update_reputation(reputation_updates)
                 if batch_result.get('success'):
                     logger.info(f"Epoch {epoch_id}: Batch updated {len(reputation_updates)} node reputations on blockchain")
                 else:

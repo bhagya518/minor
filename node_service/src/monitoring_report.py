@@ -187,14 +187,24 @@ class ReportVerifier:
     def from_dict(data: dict) -> MonitoringReport:
         """Create report from dictionary (e.g., after P2P transmission)"""
         # Filter out fields that shouldn't be passed to __init__
+        # This includes metadata fields like report_hash, signature, public_key
+        # and any extra fields added by the network layer like 'received_from'
         init_fields = {}
-        for key, value in data.items():
-            if key not in ['report_hash', 'signature', 'public_key']:
-                init_fields[key] = value
+        
+        # Valid fields for MonitoringReport constructor
+        valid_fields = [
+            'url', 'epoch_id', 'response_ms', 'status_code', 
+            'ssl_valid', 'content_hash', 'is_reachable', 
+            'node_address', 'timestamp', 'version'
+        ]
+        
+        for key in valid_fields:
+            if key in data:
+                init_fields[key] = data[key]
         
         report = MonitoringReport(**init_fields)
         
-        # Set the fields that were filtered out
+        # Set the cryptographically significant fields that were filtered out
         if 'report_hash' in data:
             report.report_hash = data['report_hash']
         if 'signature' in data:
@@ -205,12 +215,12 @@ class ReportVerifier:
         return report
 
 
-def current_epoch(window_seconds: int = 60) -> int:
+def current_epoch(window_seconds: int = 5) -> int:
     """
     All nodes produce the same epoch_id within the same time window.
     
     Args:
-        window_seconds: Duration of each epoch (default: 60 seconds)
+        window_seconds: Duration of each epoch (default: 5 seconds)
         
     Returns:
         Current epoch number (unix_time // window_seconds)

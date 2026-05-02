@@ -24,6 +24,7 @@ import logging
 import hashlib
 import time
 from datetime import datetime, timedelta
+import asyncio
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -96,11 +97,83 @@ class EnhancedMLConsensusEngine:
             'QUARANTINE': [],  # Low reputation nodes
             'SLASHED': []      # Malicious nodes
         }
+        
+        # Persistence
+        self.state_file = os.path.join(os.path.dirname(__file__), '..', f'reputation_state_{self.node_id}.json')
+        self.load_state()
+        
         self.shard_engines = {}  # shard_id -> local ML engine
         self.shard_results = {}  # shard_id -> local results
         
         logger.info(f"EnhancedMLConsensusEngine initialized for node {node_id}")
+
+    def get_all_nodes_status(self) -> Dict[str, Dict]:
+        """Get the current status and reputation for all known nodes"""
+        status_map = {}
+        # Get all unique nodes from our tracking dicts
+        all_nodes = set(self.reputation.keys()) | set(self.ewma_reputations.keys()) | set(self.mitigation_actions.keys())
+        
+        for nid in all_nodes:
+            rep = self.reputation.get(nid, 0.95)
+            ewma = self.ewma_reputations.get(nid, 0.95)
+            decision = self.mitigation_actions.get(nid)
+            
+            if decision:
+                status_map[nid] = {
+                    "reputation": rep,
+                    "ewma_reputation": ewma,
+                    "status": decision.status,
+                    "action": decision.action,
+                    "shard": decision.shard
+                }
+            else:
+                # Default for nodes with no mitigation decision yet
+                mitigation = self.apply_mitigation_policy(ewma)
+                status_map[nid] = {
+                    "reputation": rep,
+                    "ewma_reputation": ewma,
+                    "status": mitigation.status,
+                    "action": mitigation.action,
+                    "shard": mitigation.shard
+                }
+        return status_map
+
+    def get_shard_distribution(self) -> Dict[str, int]:
+        """Get the number of nodes in each shard"""
+        dist = {"PRIMARY": 0, "MONITORING": 0, "QUARANTINE": 0, "SLASHED": 0}
+        for nid, ewma in self.ewma_reputations.items():
+            decision = self.apply_mitigation_policy(ewma)
+            dist[decision.shard] += 1
+        return dist
     
+    def save_state(self):
+        """Save current reputation state to disk"""
+        try:
+            state = {
+                'reputation': self.reputation,
+                'ewma_reputations': self.ewma_reputations,
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f, indent=4)
+            logger.info(f"💾 Saved reputation state for {len(self.reputation)} nodes")
+        except Exception as e:
+            logger.error(f"Failed to save reputation state: {e}")
+
+    def load_state(self):
+        """Load reputation state from disk"""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                self.reputation = state.get('reputation', {})
+                self.ewma_reputations = state.get('ewma_reputations', {})
+                logger.info(f"📂 Loaded reputation state for {len(self.reputation)} nodes")
+            except Exception as e:
+                logger.error(f"Failed to load reputation state: {e}")
+        else:
+            logger.info("No existing reputation state found, starting fresh")
+
     def load_enhanced_models(self):
         """Load ML_MINOR models with proper scaler handling"""
         try:
@@ -191,6 +264,9 @@ class EnhancedMLConsensusEngine:
             self.reputation[node_id] = trust_score
             self.reputation_history[node_id].append(trust_score)
             
+            # Get previous for logging continuity
+            prev_val = self.ewma_reputations.get(node_id, trust_score)
+            
             # Apply EWMA smoothing
             smoothed_reputation = self.apply_ewma_smoothing(node_id, trust_score)
             
@@ -198,7 +274,10 @@ class EnhancedMLConsensusEngine:
             decision = self.apply_mitigation_policy(smoothed_reputation)
             self.mitigation_actions[node_id] = decision
             
-            logger.debug(f"Updated reputation for {node_id}: {trust_score:.4f} -> {smoothed_reputation:.4f}")
+            # Final Step: Persist this local update
+            self.save_state()
+            
+            logger.debug(f"Reputation Continuity for {node_id}: {(prev_val or 0.0):.4f} (prev) -> {(smoothed_reputation or 0.0):.4f} (new)")
             
         except Exception as e:
             logger.error(f"Error updating reputation for {node_id}: {e}")
@@ -217,6 +296,58 @@ class EnhancedMLConsensusEngine:
     def normalize_0_1(self, arr: np.ndarray, mn: float, mx: float) -> np.ndarray:
         """Normalize array to 0-1 range"""
         return (arr - mn) / (mx - mn + 1e-12)
+
+    def calculate_batch_reputation(self, features_list: List[Dict]) -> List[float]:
+        """Vectorized batch reputation calculation for high performance"""
+        if not features_list:
+            return []
+        
+        try:
+            # 1. Prepare RF Feature Matrix
+            rf_data = []
+            for feat in features_list:
+                row = [float(feat.get(col, 0.0)) for col in self.rf_feature_cols]
+                rf_data.append(row)
+            
+            rf_matrix = np.array(rf_data)
+            if hasattr(self.rf_scaler, 'mean_'):
+                rf_scaled = self.rf_scaler.transform(rf_matrix)
+            else:
+                rf_scaled = rf_matrix
+            
+            # Batch RF Prediction
+            rf_probs = self.rf_model.predict_proba(rf_scaled)[:, 1]
+            
+            # 2. Prepare ISO Feature Matrix
+            iso_data = []
+            for feat in features_list:
+                row = [float(feat.get(col, 0.0)) for col in self.behavioral_cols]
+                iso_data.append(row)
+            
+            iso_matrix = np.array(iso_data)
+            if self.iso_scaler and hasattr(self.iso_scaler, 'mean_'):
+                iso_scaled = self.iso_scaler.transform(iso_matrix)
+            else:
+                iso_scaled = iso_matrix
+                
+            # Batch ISO Prediction
+            iso_scores = -self.iso_model.decision_function(iso_scaled)
+            iso_norms = np.clip(iso_scores / 10.0, 0.0, 1.0)
+            
+            # 3. Fusion (Vectorized)
+            if self.meta_model is not None:
+                meta_input = np.column_stack((rf_probs, iso_norms, np.zeros_like(rf_probs)))
+                meta_probs = self.meta_model.predict_proba(meta_input)
+                reputations = meta_probs[:, 1] if meta_probs.shape[1] > 1 else meta_probs[:, 0]
+            else:
+                iso_reps = 1.0 - iso_norms
+                reputations = (0.7 * rf_probs) + (0.3 * iso_reps)
+            
+            return np.clip(reputations, 0.0, 1.0).tolist()
+            
+        except Exception as e:
+            logger.error(f"Error in batch reputation calculation: {e}")
+            return [0.5] * len(features_list)
     
     def calculate_enhanced_reputation(self, features: Dict) -> float:
         """Calculate enhanced reputation using ML models"""
@@ -407,111 +538,110 @@ class EnhancedMLConsensusEngine:
         Process epoch consensus using ML models - MAIN CONSENSUS METHOD
         This is called by epoch_manager to evaluate all reports for an epoch
         """
-        logger.info(f"🤖 ML CONSENSUS RUNNING for epoch {epoch_id} with {len(reports)} reports")
+        logger.info(f"🚀 STARTING SHARDED CONSENSUS for epoch {epoch_id}")
         
         results = {
             'epoch_id': epoch_id,
-            'engine_type': 'ML_Enhanced',
+            'engine_type': 'ML_Enhanced_Sharding',
             'reputations': {},
             'ewma_reputations': {},
             'mitigation_actions': {},
-            'shard_distribution': {},
+            'shard_distribution': {
+                'PRIMARY': 0,
+                'MONITORING': 0,
+                'QUARANTINE': 0,
+                'SLASHED': 0
+            },
             'alpha': self.alpha,
-            'predictions': []  # For epoch_manager compatibility
+            'processing_time_ms': 0
         }
         
-        # CRITICAL FIX: Group reports by sender for proper evaluation
+        start_time = time.time()
+        
+        # Group reports by sender for proper evaluation
         reports_by_sender = {}
         for r in reports:
             sender = r.get("node_address") or r.get("sender_id") or r.get("node_id") or r.get("received_from")
             if sender:
                 reports_by_sender.setdefault(sender, []).append(r)
         
-        logger.info(f"Grouped reports by sender: {list(reports_by_sender.keys())}")
+        # Assign nodes to shards based on CURRENT reputation
+        current_shards = {
+            'PRIMARY': [],
+            'MONITORING': [],
+            'QUARANTINE': [],
+            'SLASHED': []
+        }
         
-        # CRITICAL FIX: Update graph for collusion detection
-        self._update_collusion_graph(reports)
+        for sender_id in reports_by_sender.keys():
+            rep = self.ewma_reputations.get(sender_id, 0.90)
+            if rep > self.HEALTHY_T:
+                current_shards['PRIMARY'].append(sender_id)
+            elif rep > self.SUSPICIOUS_T:
+                current_shards['MONITORING'].append(sender_id)
+            elif rep > self.FAULTY_T:
+                current_shards['QUARANTINE'].append(sender_id)
+            else:
+                current_shards['SLASHED'].append(sender_id)
         
-        # Evaluate each sender based on THEIR reports
-        for sender_id, sender_reports in reports_by_sender.items():
-            logger.info(f"Evaluating sender {sender_id} with {len(sender_reports)} reports")
+        logger.info(f"Shard assignments: {[(k, len(v)) for k, v in current_shards.items()]}")
+        
+        # High Performance Pass 1: Extract features for ALL nodes
+        all_node_ids = list(reports_by_sender.keys())
+        features_to_predict = []
+        for sender_id in all_node_ids:
+            sender_reports = reports_by_sender[sender_id]
+            features = self._extract_features_from_reports(sender_reports, all_reports_context=reports)
+            features['collusion_score'] = 0.0
+            features_to_predict.append(features)
+        
+        # High Performance Pass 2: Batch Predict reputations (Vectorized)
+        batch_reputations = self.calculate_batch_reputation(features_to_predict)
+        
+        # High Performance Pass 3: Apply smoothing and policies
+        for i, sender_id in enumerate(all_node_ids):
+            reputation = batch_reputations[i]
             
-            # Extract features from this sender's reports
-            features = self._extract_features_from_reports(
-                sender_reports, all_reports_context=reports
-            )
-            
-            # CRITICAL FIX: Add collusion detection features
-            collusion_score = self._detect_collusion(sender_id, reports)
-            features['collusion_score'] = collusion_score
-            
-            # Calculate reputation using ML
-            reputation = self.calculate_enhanced_reputation(features)
-            
-            # Apply EWMA smoothing (with corrected formula)
+            # Apply EWMA smoothing
             smoothed_rep = self.apply_ewma_smoothing(sender_id, reputation)
             
-            # Store reputations
-            results['reputations'][sender_id] = smoothed_rep
-            results['ewma_reputations'][sender_id] = self.ewma_reputations.get(sender_id, smoothed_rep)
+            # Update internal state
+            self.reputation[sender_id] = smoothed_rep
+            self.reputation_history[sender_id].append(smoothed_rep)
             
-            # Apply mitigation policy
+            # Apply mitigation
             mitigation = self.apply_mitigation_policy(smoothed_rep)
+            self.mitigation_actions[sender_id] = mitigation
+            
+            # Store in results
+            results['reputations'][sender_id] = smoothed_rep
+            results['ewma_reputations'][sender_id] = smoothed_rep
             results['mitigation_actions'][sender_id] = {
                 'status': mitigation.status,
                 'action': mitigation.action,
                 'shard': mitigation.shard
             }
+            results['shard_distribution'][mitigation.shard] += 1
             
-            # Update shard distribution
-            shard = mitigation.shard
-            results['shard_distribution'][shard] = results['shard_distribution'].get(shard, 0) + 1
-            
-            # Add prediction for epoch_manager compatibility
-            results['predictions'].append({
-                'node_id': sender_id,
-                'malicious_probability': 1.0 - smoothed_rep,
-                'p_malicious': 1.0 - smoothed_rep,  # Alias for compatibility
-                'reputation': smoothed_rep,
-                'status': mitigation.status,
-                'collusion_score': collusion_score
-            })
-            
-            logger.info(f"✅ Sender {sender_id}: reputation={smoothed_rep:.4f}, status={mitigation.status}, collusion={collusion_score:.4f}")
+        results['processing_time_ms'] = (time.time() - start_time) * 1000
         
-        # Store consensus results
-        self.consensus_decisions[epoch_id] = results
+        # --- HUMAN READABLE SUMMARY ---
+        healthy = results['shard_distribution'].get('PRIMARY', 0)
+        warning = results['shard_distribution'].get('MONITORING', 0)
+        faulty = results['shard_distribution'].get('QUARANTINE', 0)
+        slashed = results['shard_distribution'].get('SLASHED', 0)
         
-        logger.info(f"✅ Epoch {epoch_id} consensus completed: {len(results['reputations'])} nodes evaluated")
+        logger.info("=" * 60)
+        logger.info(f"📊 EPOCH {results.get('epoch_id', '???')} NETWORK HEALTH")
+        logger.info(f"   [✅ Healthy: {healthy}]  [⚠️ Warning: {warning}]  [🚫 Faulty: {faulty}]  [💀 Slashed: {slashed}]")
+        logger.info(f"   ⏱️  Processed {len(all_node_ids)} nodes in {results['processing_time_ms']:.1f}ms")
+        logger.info("=" * 60)
+        
+        # Final Step: Persist state after each epoch
+        self.save_state()
+        
         return results
-    
-    def get_node_status(self, node_id: str) -> Optional[Dict]:
-        """Get current status of a node"""
-        if node_id not in self.mitigation_actions:
-            return None
-        
-        decision = self.mitigation_actions[node_id]
-        return {
-            'node_id': node_id,
-            'reputation': self.reputation.get(node_id, 0.0),
-            'ewma_reputation': self.ewma_reputations.get(node_id, 0.0),
-            'status': decision.status,
-            'action': decision.action,
-            'shard': decision.shard,
-            'history_length': len(self.reputation_history.get(node_id, []))
-        }
-    
-    def get_all_nodes_status(self) -> Dict:
-        """Get status of all evaluated nodes"""
-        return {
-            node_id: self.get_node_status(node_id)
-            for node_id in self.mitigation_actions.keys()
-        }
 
-    def process_epoch_consensus_legacy(self, epoch_id: int, reports: List[Dict]) -> Dict:
-        """Legacy alias retained for compatibility. Uses the main (collusion-aware) implementation."""
-        return self.process_epoch_consensus(epoch_id, reports)
-    
     def _extract_features_from_reports(self, sender_reports: List[Dict], all_reports_context: List[Dict] = None) -> Dict:
         """Extract features from node reports for ML evaluation (internal method)"""
         if not sender_reports:
@@ -592,7 +722,7 @@ class EnhancedMLConsensusEngine:
         
         logger.debug(f"Features for sender {sender_id}: {features}")
         return features
-    
+
     def _update_collusion_graph(self, reports: List[Dict]):
         """Update the collusion detection graph based on reports"""
         # Group reports by URL to find agreement patterns
@@ -602,254 +732,31 @@ class EnhancedMLConsensusEngine:
             if url:
                 reports_by_url.setdefault(url, []).append(r)
         
-        # For each URL, add edges between nodes that agree
         for url, url_reports in reports_by_url.items():
-            node_votes = {}
-            for r in url_reports:
-                node_id = r.get("node_address") or r.get("sender_id") or r.get("node_id") or r.get("received_from")
-                if node_id:
-                    node_votes[node_id] = r.get("is_reachable", True)
-            
-            # Add edges between nodes that agree (potential collusion)
-            node_ids = list(node_votes.keys())
-            for i, node_i in enumerate(node_ids):
-                for node_j in node_ids[i+1:]:
-                    if node_votes[node_i] == node_votes[node_j]:
-                        # Nodes agree - add or strengthen edge
-                        if self.graph.has_edge(node_i, node_j):
-                            self.graph[node_i][node_j]['weight'] += 1
-                        else:
-                            self.graph.add_edge(node_i, node_j, weight=1, agreement=node_votes[node_i])
+            for i in range(len(url_reports)):
+                for j in range(i + 1, len(url_reports)):
+                    node_i = url_reports[i].get("node_address")
+                    node_j = url_reports[j].get("node_address")
+                    
+                    if node_i and node_j and node_i != node_j:
+                        vote_i = url_reports[i].get("is_reachable")
+                        vote_j = url_reports[j].get("is_reachable")
+                        
+                        if vote_i == vote_j:
+                            # Agreement edge
+                            if self.graph.has_edge(node_i, node_j):
+                                self.graph[node_i][node_j]['weight'] += 1
+                            else:
+                                self.graph.add_edge(node_i, node_j, weight=1)
     
     def _detect_collusion(self, node_id: str, reports: List[Dict]) -> float:
-        """Detect collusion for a specific node using graph analysis"""
+        """Detect collusion for a specific node"""
         if node_id not in self.graph:
             return 0.0
         
+        # Use PageRank or centralities for collusion detection
         try:
-            # Calculate clustering coefficient (high = potential collusion)
-            clustering = nx.clustering(self.graph.to_undirected(), node_id)
-            
-            # Count strong connections (high edge weights)
-            strong_connections = sum(1 for _, data in self.graph[node_id].items() if data.get('weight', 0) >= 3)
-            
-            # Combine metrics for collusion score
-            collusion_score = min(1.0, clustering * 0.5 + (strong_connections / max(len(self.graph), 1)) * 0.5)
-            
-            return collusion_score
+            centrality = nx.degree_centrality(self.graph).get(node_id, 0.0)
+            return min(centrality * 2.0, 1.0)
         except:
             return 0.0
-    
-    def get_shard_distribution(self) -> Dict:
-        """Get distribution of nodes across shards"""
-        shard_counts = defaultdict(int)
-        for decision in self.mitigation_actions.values():
-            shard_counts[decision.shard] += 1
-        
-        return dict(shard_counts)
-    
-    def _assign_nodes_to_shards(self, reports: List[Dict]) -> Dict[str, List[Dict]]:
-        """
-        Assign nodes to 4 shards based on their reputation scores
-        Returns: shard_id -> list of reports for that shard
-        """
-        shard_assignments = {
-            'PRIMARY': [],
-            'MONITORING': [],
-            'QUARANTINE': [],
-            'SLASHED': []
-        }
-        
-        # Group reports by sender
-        reports_by_sender = {}
-        for r in reports:
-            sender = r.get("node_address") or r.get("sender_id") or r.get("node_id") or r.get("received_from")
-            if sender:
-                reports_by_sender.setdefault(sender, []).append(r)
-        
-        # Assign each sender to a shard based on their current reputation
-        for sender_id, sender_reports in reports_by_sender.items():
-            # Get reputation for this sender
-            if sender_id in self.reputation:
-                rep = self.reputation[sender_id]
-            elif sender_id in self.ewma_reputations:
-                rep = self.ewma_reputations[sender_id]
-            else:
-                rep = 0.5  # Default neutral reputation
-            
-            # Assign to shard based on reputation thresholds
-            if rep > self.HEALTHY_T:
-                shard = 'PRIMARY'
-            elif rep > self.SUSPICIOUS_T:
-                shard = 'MONITORING'
-            elif rep > self.FAULTY_T:
-                shard = 'QUARANTINE'
-            else:
-                shard = 'SLASHED'
-            
-            shard_assignments[shard].extend(sender_reports)
-            
-            # Track in shard lists
-            if sender_id not in self.shards[shard]:
-                self.shards[shard].append(sender_id)
-        
-        return shard_assignments
-    
-    def _process_shard_consensus(self, shard_id: str, reports: List[Dict]) -> Dict:
-        """
-        Process consensus for a single shard locally
-        Each shard runs its own ML evaluation independently
-        """
-        if not reports:
-            return {
-                'shard_id': shard_id,
-                'evaluated': 0,
-                'reputations': {},
-                'status': 'empty'
-            }
-        
-        logger.info(f"Processing shard {shard_id} with {len(reports)} reports")
-        
-        shard_results = {
-            'shard_id': shard_id,
-            'evaluated': 0,
-            'reputations': {},
-            'mitigations': {},
-            'status': 'active'
-        }
-        
-        # Group reports by sender
-        reports_by_sender = {}
-        for r in reports:
-            sender = r.get("node_address") or r.get("sender_id") or r.get("node_id") or r.get("received_from")
-            if sender:
-                reports_by_sender.setdefault(sender, []).append(r)
-        
-        # Evaluate each sender in this shard
-        for sender_id, sender_reports in reports_by_sender.items():
-            features = self._extract_features_from_reports(sender_reports, all_reports_context=reports)
-            
-            # Add collusion detection
-            collusion_score = self._detect_collusion(sender_id, reports)
-            features['collusion_score'] = collusion_score
-            
-            # Calculate reputation using ML
-            reputation = self.calculate_enhanced_reputation(features)
-            
-            # Apply EWMA smoothing
-            smoothed_rep = self.apply_ewma_smoothing(sender_id, reputation)
-            
-            # Apply mitigation policy
-            mitigation = self.apply_mitigation_policy(smoothed_rep)
-            
-            shard_results['reputations'][sender_id] = smoothed_rep
-            shard_results['mitigations'][sender_id] = {
-                'status': mitigation.status,
-                'action': mitigation.action,
-                'shard': mitigation.shard
-            }
-            shard_results['evaluated'] += 1
-        
-        logger.info(f"Shard {shard_id} consensus completed: {shard_results['evaluated']} nodes evaluated")
-        return shard_results
-    
-    def _aggregate_shard_results(self, shard_results: Dict[str, Dict]) -> Dict:
-        """
-        Aggregate results from all shards into global consensus
-        This simulates the global aggregation step in sharded consensus
-        """
-        global_results = {
-            'reputations': {},
-            'mitigation_actions': {},
-            'shard_distribution': {},
-            'shard_details': {}
-        }
-        
-        # Combine results from all shards
-        for shard_id, results in shard_results.items():
-            global_results['shard_details'][shard_id] = results
-            
-            # Count nodes per shard
-            global_results['shard_distribution'][shard_id] = results.get('evaluated', 0)
-            
-            # Merge reputations
-            for node_id, rep in results.get('reputations', {}).items():
-                global_results['reputations'][node_id] = rep
-            
-            # Merge mitigation actions
-            for node_id, action in results.get('mitigations', {}).items():
-                global_results['mitigation_actions'][node_id] = action
-        
-        return global_results
-    
-    def process_sharded_consensus(self, epoch_id: int, reports: List[Dict]) -> Dict:
-        """
-        Process consensus using REAL parallel sharding
-        1. Divide nodes into 4 shards based on reputation
-        2. Process each shard independently (local consensus)
-        3. Aggregate results into global consensus
-        """
-        logger.info(f"🚀 STARTING SHARDED CONSENSUS for epoch {epoch_id}")
-        
-        start_time = time.time()
-        
-        # Step 1: Assign nodes to shards
-        shard_assignments = self._assign_nodes_to_shards(reports)
-        logger.info(f"Shard assignments: {[(k, len(v)) for k, v in shard_assignments.items()]}")
-        
-        # Step 2: Process each shard in parallel.
-        # ML evaluation is CPU-bound; asyncio won't provide true parallelism.
-        shard_results = {}
-        shard_items = [(sid, srep) for sid, srep in shard_assignments.items() if srep]
-        if shard_items:
-            max_workers = min(4, len(shard_items))
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    pool.submit(self._process_shard_consensus, shard_id, shard_reports): shard_id
-                    for shard_id, shard_reports in shard_items
-                }
-                for fut in as_completed(futures):
-                    shard_id = futures[fut]
-                    try:
-                        shard_results[shard_id] = fut.result()
-                    except Exception as e:
-                        logger.error(f"Shard {shard_id} failed: {e}")
-        
-        # Step 3: Aggregate all shard results
-        global_results = self._aggregate_shard_results(shard_results)
-        
-        # Step 4: Build final consensus results
-        results = {
-            'epoch_id': epoch_id,
-            'engine_type': 'SHARDED_ML',
-            'reputations': global_results['reputations'],
-            'ewma_reputations': self.ewma_reputations.copy(),
-            'mitigation_actions': global_results['mitigation_actions'],
-            'shard_distribution': global_results['shard_distribution'],
-            'shard_details': global_results['shard_details'],
-            'alpha': self.alpha,
-            'predictions': [],
-            'processing_time_ms': (time.time() - start_time) * 1000,
-            'sharding_enabled': True
-        }
-        
-        # Build predictions list for epoch_manager compatibility
-        for node_id, rep in global_results['reputations'].items():
-            mitigation = global_results['mitigation_actions'].get(node_id, {})
-            
-            results['predictions'].append({
-                'node_id': node_id,
-                'malicious_probability': 1.0 - rep,
-                'p_malicious': 1.0 - rep,
-                'reputation': rep,
-                'status': mitigation.get('status', 'UNKNOWN'),
-                'shard': mitigation.get('shard', 'UNKNOWN')
-            })
-        
-        # Store consensus results
-        self.consensus_decisions[epoch_id] = results
-        
-        logger.info(f"✅ SHARDED CONSENSUS completed in {results['processing_time_ms']:.1f}ms")
-        logger.info(f"   Evaluated {len(results['reputations'])} nodes across {len([s for s in results['shard_distribution'].values() if s > 0])} shards")
-        
-        return results

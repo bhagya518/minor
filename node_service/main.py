@@ -65,7 +65,7 @@ except ImportError as e:
 
 # Import monitoring components
 try:
-    from src.website_monitor import WebsiteMonitor, MonitoringScheduler, set_node_id, set_node_mode, NODE_SIGNER
+    from src.website_monitor import WebsiteMonitor, MonitoringScheduler, set_node_id, set_node_mode, NODE_SIGNER, _build_signed_report
     from src.trust_engine import TrustEngine, TrustCalculator
     from src.peer_client import PeerClient
     from src.epoch_manager import init_epoch_manager, get_epoch_manager
@@ -245,13 +245,7 @@ async def startup_event():
                 logger.warning(f"Failed to initialize Enhanced ML consensus engine: {e}")
                 ml_consensus = None
         
-        # Initialize Epoch Manager for Phase 3 consensus
-        try:
-            epoch_manager = init_epoch_manager(node_config.node_id, ml_consensus, blockchain_client)
-            logger.info("Epoch Manager initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Epoch Manager: {e}")
-            epoch_manager = None
+
         
         # Initialize legacy ML classifier (fallback)
         try:
@@ -313,6 +307,14 @@ async def startup_event():
             logger.warning("Monitoring and consensus will continue to work locally")
             blockchain_client = None  # Ensure it's None for checks elsewhere
         
+        # Initialize Epoch Manager for Phase 3 consensus
+        try:
+            epoch_manager = init_epoch_manager(node_config.node_id, ml_consensus, blockchain_client)
+            logger.info("Epoch Manager initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Epoch Manager: {e}")
+            epoch_manager = None
+            
         # Register node on blockchain
         if blockchain_client:
             try:
@@ -432,9 +434,9 @@ async def cleanup_loop():
             
             # Prune peer_reports - keep only current + previous epoch
             global peer_reports
-            current_epoch = int(__import__('time').time() // 60)
+            current_epoch_id = int(__import__('time').time() // 5)
             peer_reports = [r for r in peer_reports 
-                          if r.get("epoch_id", 0) >= current_epoch - 1]
+                          if r.get("epoch_id", 0) >= current_epoch_id - 1]
             logger.debug(f"Pruned peer_reports to {len(peer_reports)} entries")
             
             await asyncio.sleep(3600)  # Cleanup every hour
@@ -488,7 +490,7 @@ async def run_consensus_and_slash():
     try:
         # Get current epoch
         from time import time
-        epoch_id = int(time() // 60)
+        epoch_id = int(time() // 5)
         
         # Trigger epoch processing
         logger.info(f"Triggering consensus for epoch {epoch_id}")
@@ -600,7 +602,7 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
             if node_vote != majority_verdict:
                 # Diverges from majority — slash reputation
                 if ml_consensus:
-                    current = ml_consensus.reputation.get(node_id, 0.95)
+                    current = ml_consensus.reputation.get(node_id, 0.90)
                     ml_consensus.reputation[node_id] = max(0.0, current - 0.15)
                     logger.warning(
                         f"SLASHED {node_id}: voted {node_vote} but majority={majority_verdict} "
@@ -611,7 +613,7 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
             else:
                 # Agrees with majority — small reputation boost
                 if ml_consensus:
-                    current = ml_consensus.reputation.get(node_id, 0.95)
+                    current = ml_consensus.reputation.get(node_id, 0.90)
                     ml_consensus.reputation[node_id] = min(1.0, current + 0.01)
                 results["honest"].append(node_id)
                 results["node_reputations"][node_id] = ml_consensus.reputation.get(node_id, 0.5) if ml_consensus else 0.5
@@ -681,13 +683,13 @@ async def process_monitoring_results():
         else:
             trust_score = 0.8  # Default trust
 
-        # Get ML score from live integration
-        if enhanced_results:
-            latest_result = enhanced_results[-1]
-            ml_score = latest_result.get('ml_score', 0.5)
-            ml_prediction = latest_result.get('ml_prediction', 'unknown')
+        # Get ML score from live integration (EnhancedMLConsensusEngine)
+        if ml_consensus:
+            ml_score = ml_consensus.reputation.get(node_config.node_id, 0.90)
+            decision = ml_consensus.mitigation_actions.get(node_config.node_id)
+            ml_prediction = decision.status if decision else 'unknown'
         else:
-            ml_score = 0.5
+            ml_score = 0.90
             ml_prediction = 'unknown'
         
         # Update ML consensus engine reputation with trust score
@@ -697,8 +699,8 @@ async def process_monitoring_results():
         # Calculate PoR score
         por_score = TrustCalculator.calculate_por_score(trust_score, ml_score)
         
-        logger.info(f"Trust: {trust_score:.4f}, ML: {ml_score:.4f}, PoR: {por_score:.4f}")
-        logger.info(f"Reputation updated for {node_config.node_id}: {trust_score:.4f}")
+        logger.info(f"Trust: {trust_score or 0.0:.4f}, ML: {ml_score or 0.0:.4f}, PoR: {por_score or 0.0:.4f}")
+        logger.info(f"Reputation updated for {node_config.node_id}: {trust_score or 0.0:.4f}")
         
         # REMOVED: Per-node blockchain writes
         # Blockchain writes now handled by epoch_manager leader only (batch per epoch)
@@ -721,8 +723,6 @@ async def process_monitoring_results():
         
         if results and monitoring_available:
             try:
-                from website_monitor import _build_signed_report
-                
                 # Get the last monitoring result
                 last_result = results[-1]
                 
@@ -752,7 +752,7 @@ async def process_monitoring_results():
                 
                 # Add own report to epoch_manager for Phase 3 consensus (reputation-weighted)
                 if epoch_manager:
-                    epoch_manager.add_report(asdict(signed_report), is_own=True)
+                    await epoch_manager.add_report(asdict(signed_report), is_own=True)
                     logger.info(f"Added own report to epoch_manager for epoch {signed_report.epoch_id}")
                 
                 # Run consensus and slashing
@@ -1073,7 +1073,7 @@ async def receive_peer_report(payload: dict, request: Request):
         
         # Store verified report in epoch_manager (Phase 3)
         if epoch_manager:
-            epoch_manager.add_report(asdict(report), is_own=False)
+            await epoch_manager.add_report(asdict(report), is_own=False)
             logger.info(f"Added peer report from {node_address} to epoch_manager for epoch {report.epoch_id}")
         else:
             # Fallback to peer_reports for compatibility
@@ -1370,5 +1370,6 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         reload=False,
-        log_level="info"
+        log_level="info",
+        access_log=False
     )
