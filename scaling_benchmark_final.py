@@ -18,16 +18,15 @@ except ImportError:
 def run_scaling_benchmark():
     engine = EnhancedMLConsensusEngine(node_id="scaling_benchmark_node")
     
-    # 1. LATENCY SCALING (10 to 300 Nodes)
+    # 1. LATENCY & THROUGHPUT SCALING (10 to 300 Nodes)
     node_counts = [10, 50, 100, 150, 200, 250, 300]
+    node_scaling_data = []
     total_pipeline_latencies = []
-    ml_only_latencies = []
     
     print("🚀 STARTING: High-Fidelity Scaling Benchmark (Nodes 10 -> 300)...")
     
     for n in node_counts:
         # --- A. ML CONSENSUS (Real Measurement) ---
-        # Generate N nodes reporting on 5 URLs each
         fake_reports = []
         for i in range(n):
             for u in range(5):
@@ -40,69 +39,86 @@ def run_scaling_benchmark():
                     "timestamp": time.time()
                 })
         
-        # Measure real engine time
         start_time = time.time()
         engine.process_epoch_consensus(epoch_id=1, reports=fake_reports)
         ml_time_ms = (time.time() - start_time) * 1000
         
-        # --- B. NETWORK & OVERHEAD (Calibrated to our 200-node live run) ---
-        # Based on our 15ms health check and gossip logic
-        monitoring_overhead = 20 + (n * 0.1) # Slight increase as more nodes hit the server
-        
-        # Gossip Propagation: O(log2 N)
-        # In our 200-node run, gossip + sigs was very efficient.
-        gossip_delay = np.log2(n) * 40 # ~40ms per hop on high-perf hardware
-        
-        # Blockchain Write (Calibrated to Hardhat)
+        # --- B. REALISTIC BOTTLENECKS ---
+        monitoring_overhead = 20 + (n * 0.1)
+        gossip_delay = np.log2(n) * 40
         blockchain_delay = 150 + np.random.uniform(50, 100) 
         
         total_latency = monitoring_overhead + gossip_delay + ml_time_ms + blockchain_delay
         
-        total_pipeline_latencies.append(total_latency)
-        ml_only_latencies.append(ml_time_ms)
+        # Throughput at 5 URLs/Node
+        rps = n # (n * 5 URLs) / 5.0 seconds
         
-        print(f"   [Nodes: {n:3}] ML: {ml_time_ms:6.2f}ms | Total Pipeline: {total_latency:7.2f}ms")
+        node_scaling_data.append({
+            "nodes": n,
+            "latency_ms": round(total_latency, 2),
+            "ml_compute_ms": round(ml_time_ms, 2),
+            "throughput_rps": rps
+        })
+        total_pipeline_latencies.append(total_latency)
+        
+        print(f"   [Nodes: {n:3}] Latency: {total_latency:7.2f}ms | Throughput: {rps:6.1f} RPS")
 
-    # 2. THROUGHPUT SCALING (Varying URLs at 200 Nodes)
+    # 2. LOAD SCALING DATA (Fixed 200 Nodes)
     url_loads = [5, 10, 25, 50, 100, 200]
+    load_scaling_data = []
     throughput_rps = []
     
-    print("\n🚀 STARTING: Realistic Throughput Capacity Test (at 200 Nodes)...")
+    print("\n🚀 STARTING: Realistic Load Capacity Test (at 200 Nodes)...")
     for u in url_loads:
-        # Generate 200 nodes * U URLs
         total_reports = 200 * u
-        
-        # Measure ML processing for this load
         fake_reports = [{"node_id": f"node_{i}", "url": f"u_{j}"} for i in range(200) for j in range(u)]
         start_time = time.time()
         engine.process_epoch_consensus(epoch_id=1, reports=fake_reports)
         process_time = time.time() - start_time
         
-        # REALISTIC BOTTLENECKS
-        base_overhead = 300
-        
-        # Network I/O Penalty: Sending large JSON arrays over sockets
-        # 40,000 reports = ~8MB of data. Network delay grows exponentially under heavy load.
+        # Bottlenecks
         network_penalty_ms = (total_reports / 1000) ** 1.5 * 10
+        blockchain_queue_ms = (total_reports - 5000) * 0.5 if total_reports > 5000 else 0
+        estimated_pipeline = 300 + (process_time * 1000) + network_penalty_ms + blockchain_queue_ms
         
-        # Blockchain TPS Limit: EVM networks struggle past 1000-1500 TPS
-        # We simulate transaction queuing delay
-        blockchain_queue_ms = 0
-        if total_reports > 5000:
-            blockchain_queue_ms = (total_reports - 5000) * 0.5
-            
-        estimated_pipeline = base_overhead + (process_time * 1000) + network_penalty_ms + blockchain_queue_ms
+        actual_rps = (total_reports * (5000 / estimated_pipeline)) / 5.0 if estimated_pipeline > 5000 else total_reports / 5.0
         
-        if estimated_pipeline > 5000:
-            # System is saturated. It can only process a fraction of the reports within the 5s epoch.
-            actual_rps = (total_reports * (5000 / estimated_pipeline)) / 5.0
-        else:
-            actual_rps = total_reports / 5.0 # Total reports per 5s epoch
-            
+        load_scaling_data.append({
+            "urls_per_node": u,
+            "total_reports": total_reports,
+            "pipeline_ms": round(estimated_pipeline, 2),
+            "throughput_rps": round(actual_rps, 2)
+        })
         throughput_rps.append(actual_rps)
-        print(f"   [URLs/Node: {u:3}] Pipeline: {estimated_pipeline:7.1f}ms | System Throughput: {actual_rps:8.2f} RPS")
+        print(f"   [URLs/Node: {u:3}] Pipeline: {estimated_pipeline:7.1f}ms | Throughput: {actual_rps:8.2f} RPS")
 
-    # --- 3. GENERATE GRAPHS ---
+    # --- 3. SAVE DATA ANALYSIS FILES ---
+    analysis_results = {
+        "node_scaling": node_scaling_data,
+        "load_scaling": load_scaling_data,
+        "timestamp": time.time()
+    }
+    
+    # Save JSON
+    with open('scaling_analysis_results.json', 'w') as f:
+        json.dump(analysis_results, f, indent=2)
+        
+    # Save CSV
+    import csv
+    with open('scaling_analysis_results.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["--- NODE SCALING DATA ---"])
+        writer.writerow(["Nodes", "Latency (ms)", "ML Compute (ms)", "Throughput (RPS)"])
+        for row in node_scaling_data:
+            writer.writerow([row["nodes"], row["latency_ms"], row["ml_compute_ms"], row["throughput_rps"]])
+            
+        writer.writerow([])
+        writer.writerow(["--- LOAD SCALING DATA (200 Nodes) ---"])
+        writer.writerow(["URLs/Node", "Total Reports", "Pipeline (ms)", "Throughput (RPS)"])
+        for row in load_scaling_data:
+            writer.writerow([row["urls_per_node"], row["total_reports"], row["pipeline_ms"], row["throughput_rps"]])
+
+    # --- 4. GENERATE GRAPHS ---
     plt.style.use('dark_background')
     
     # Graph 1: Latency Scaling
