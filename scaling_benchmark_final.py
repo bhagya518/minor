@@ -107,14 +107,12 @@ def run_scaling_benchmark():
     
     # Graph 1: Latency Scaling
     plt.figure(figsize=(10, 6))
-    plt.plot(node_counts, total_pipeline_latencies, marker='o', linewidth=3, color='#00ffcc', label='Total Pipeline Latency')
-    plt.plot(node_counts, ml_only_latencies, marker='x', linestyle='--', color='#ff3366', label='ML Engine Only')
+    plt.plot(node_counts, total_pipeline_latencies, marker='o', linewidth=3, color='#00ffcc', label='System Latency')
     plt.fill_between(node_counts, total_pipeline_latencies, color='#00ffcc', alpha=0.1)
     
-    plt.axhline(y=5000, color='red', linestyle=':', label='5s Sync Limit')
     plt.title('System Latency Scaling (10 to 300 Nodes)', fontsize=14, fontweight='bold', pad=20)
     plt.xlabel('Number of Active Nodes', fontsize=12)
-    plt.ylabel('Latency (milliseconds)', fontsize=12)
+    plt.ylabel('Latency (ms)', fontsize=12)
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.savefig('scaling_latency_300.png', dpi=300, bbox_inches='tight')
