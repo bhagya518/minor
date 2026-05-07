@@ -99,7 +99,8 @@ for i in $(seq 0 $((TOTAL_NODES - 1))); do
     fi
 
     # Start the node process
-    NODE_MODE=$NODE_MODE python3 "$PROJECT_DIR/node_service/main.py" \
+    NODE_MODE=$NODE_MODE uvicorn "$PROJECT_DIR/node_service/main:app" \
+        --host 0.0.0.0 \
         --port $PORT \
         --node-id "$NODE_ID" \
         > "$LOG_DIR/${NODE_ID}.log" 2>&1 &
