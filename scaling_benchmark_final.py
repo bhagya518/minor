@@ -67,7 +67,7 @@ def run_scaling_benchmark():
     url_loads = [5, 10, 25, 50, 100, 200]
     throughput_rps = []
     
-    print("\n🚀 STARTING: Throughput Capacity Test (at 200 Nodes)...")
+    print("\n🚀 STARTING: Realistic Throughput Capacity Test (at 200 Nodes)...")
     for u in url_loads:
         # Generate 200 nodes * U URLs
         total_reports = 200 * u
@@ -78,18 +78,29 @@ def run_scaling_benchmark():
         engine.process_epoch_consensus(epoch_id=1, reports=fake_reports)
         process_time = time.time() - start_time
         
-        # If total pipeline > 5s, throughput is capped by the epoch duration
-        # Based on our sharding, each node only handles a fraction, but we measure system total
-        estimated_pipeline = 300 + (process_time * 1000) # Base overhead + ML
+        # REALISTIC BOTTLENECKS
+        base_overhead = 300
+        
+        # Network I/O Penalty: Sending large JSON arrays over sockets
+        # 40,000 reports = ~8MB of data. Network delay grows exponentially under heavy load.
+        network_penalty_ms = (total_reports / 1000) ** 1.5 * 10
+        
+        # Blockchain TPS Limit: EVM networks struggle past 1000-1500 TPS
+        # We simulate transaction queuing delay
+        blockchain_queue_ms = 0
+        if total_reports > 5000:
+            blockchain_queue_ms = (total_reports - 5000) * 0.5
+            
+        estimated_pipeline = base_overhead + (process_time * 1000) + network_penalty_ms + blockchain_queue_ms
         
         if estimated_pipeline > 5000:
-            # System is saturated
+            # System is saturated. It can only process a fraction of the reports within the 5s epoch.
             actual_rps = (total_reports * (5000 / estimated_pipeline)) / 5.0
         else:
             actual_rps = total_reports / 5.0 # Total reports per 5s epoch
             
         throughput_rps.append(actual_rps)
-        print(f"   [URLs/Node: {u:3}] Total Reports: {total_reports:5} | System Throughput: {actual_rps:8.2f} RPS")
+        print(f"   [URLs/Node: {u:3}] Pipeline: {estimated_pipeline:7.1f}ms | System Throughput: {actual_rps:8.2f} RPS")
 
     # --- 3. GENERATE GRAPHS ---
     plt.style.use('dark_background')
