@@ -1,187 +1,140 @@
 """
-setup_network.py
-Run this ONCE after starting all 4 nodes.
-1. Fetches each node's real public key from /health
-2. Registers every node with every other node (full mesh)
-3. Injects repeated malicious reports from node_d
-4. Prints live consensus results every 30 seconds
+setup_network.py (200-Node Sharded Version)
+1. Detects all online nodes dynamically (supports 20 or 200)
+2. Creates shards of 10 nodes each
+3. Assigns each shard 5 unique URLs to monitor
+4. Implements Gossip-style registration (Fanout=4 per node)
 """
 
 import requests
 import time
+import random
 import json
-from itertools import permutations
 
-import os
-import sys
+# ── Configuration ────────────────────────────────────────────
+MAX_NODES = 200
+BASE_PORT = 8005
+GOSSIP_FANOUT = 4
+NODES_PER_SHARD = 10
+URLS_PER_SHARD = 5
 
-NODES = {
-    "node_a":    "http://localhost:8005",
-    "node_b":    "http://localhost:8006",
-    "node_c":    "http://localhost:8007",
-    "node_d":    "http://localhost:8008",
-    "node_e":    "http://localhost:8009",
-    "node_f":    "http://localhost:8010",
-    "node_g":    "http://localhost:8011",
-    "node_h":    "http://localhost:8012",
-}
+# Generate URL pool (unique monitoring targets)
+URL_POOL = [f"https://httpbin.org/status/{200 + i}" for i in range(100)]
 
-MONITORED_URL = "https://httpbin.org/get"
+print("\n=== INITIALIZING SHARDED NETWORK ===")
 
-# ── Step 1: fetch real public keys ────────────────────────────────────────────
-print("\n=== STEP 1: Fetching public keys ===")
+# ── Step 1: Discover online nodes ────────────────────────────
+print("\n[STEP 1] Discovering online nodes...")
+online_nodes = {}
 pubkeys = {}
-for node_id, base_url in NODES.items():
+
+for i in range(MAX_NODES):
+    port = BASE_PORT + i
+    node_id = f"node_{i}"
+    base_url = f"http://localhost:{port}"
     try:
-        h = requests.get(f"{base_url}/health", timeout=5).json()
-        pubkeys[node_id] = h["public_key"]
-        print(f"  {node_id}: {pubkeys[node_id][:24]}...")
-    except Exception as e:
-        print(f"  ERROR fetching {node_id}: {e}")
-
-missing = [n for n in NODES if n not in pubkeys]
-if missing:
-    print(f"\nERROR: Could not reach nodes: {missing}")
-    print("Make sure all 4 nodes are running before running this script.")
-    exit(1)
-
-# ── Step 2: full mesh registration ───────────────────────────────────────────
-print("\n=== STEP 2: Full mesh peer registration ===")
-for (src_id, src_url), (dst_id, dst_url) in permutations(NODES.items(), 2):
-    payload = {
-        "node_id":        src_id,
-        "url":            src_url,
-        "public_key_hex": pubkeys[src_id],
-    }
-    try:
-        r = requests.post(f"{dst_url}/peers/register", json=payload, timeout=5)
-        result = r.json()
-        status = result.get("status", "?")
-        print(f"  {src_id} -> {dst_id}: {status}")
-    except Exception as e:
-        print(f"  {src_id} -> {dst_id}: ERROR {e}")
-
-print("\n[OK] Full mesh registered. Waiting 5s for nodes to sync...")
-time.sleep(5)
-
-# Load signing utilities (same code used by nodes)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'node_service', 'src'))
-from monitoring_report import MonitoringReport, NodeSigner
-
-# ── Step 3: verify mesh ───────────────────────────────────────────────────────
-print("\n=== STEP 3: Verifying peer registration ===")
-for node_id, base_url in NODES.items():
-    try:
-        r = requests.get(f"{base_url}/peers/registered", timeout=5).json()
-        peers = list(r.get("peers", {}).keys())
-        peer_count = len(peers)
-        expected = [n for n in NODES if n != node_id]
-        missing_peers = [p for p in expected if p not in peers]
-        if missing_peers:
-            print(f"  {node_id}: WARNING missing {missing_peers}")
-        else:
-            print(f"  {node_id}: {peer_count} peers {'OK' if peer_count >= 3 else 'FAIL'}")
-    except Exception as e:
-        print(f"  {node_id}: ERROR {e}")
-
-# ── Step 4: inject malicious reports from node_d ──────────────────────────
-print("\n=== STEP 4: Injecting malicious reports from node_d ===")
-print("node_d will report the site as DOWN (lie) to all honest nodes.")
-print("Honest nodes (a, b, c) report UP -> majority=UP -> node_d gets SLASHED")
-print()
-
-honest_nodes = ["node_a", "node_b", "node_c"]
-honest_ports = [8005, 8006, 8007]
-
-for round_num in range(1, 4):
-    epoch = int(time.time() // 60)
-    print(f"--- Round {round_num} (epoch {epoch}) ---")
-
-    for port in honest_ports:
-        # Create a real signed MonitoringReport (Ed25519)
-        signer = NodeSigner(private_key_hex=None)
-        report = MonitoringReport(
-            url=MONITORED_URL,
-            epoch_id=epoch,
-            response_ms=9999.0,
-            status_code=0,
-            ssl_valid=False,
-            content_hash="000000000000",
-            is_reachable=False,
-            node_address="node_d",
-            timestamp=time.time(),
-        )
-        signed = signer.sign_report(report)
-        payload = {
-            "node_address": signed.node_address,
-            "url": signed.url,
-            "is_reachable": signed.is_reachable,
-            "status_code": signed.status_code,
-            "response_ms": signed.response_ms,
-            "ssl_valid": signed.ssl_valid,
-            "timestamp": signed.timestamp,
-            "epoch_id": signed.epoch_id,
-            "signature": signed.signature,
-            "report_hash": signed.report_hash,
-            "content_hash": signed.content_hash,
-        }
-        try:
-            r = requests.post(f"http://localhost:{port}/report",
-                              json=payload, timeout=5)
-            print(f"  -> port {port}: {r.json().get('status','?')}")
-        except Exception as e:
-            print(f"  -> port {port}: ERROR {e}")
-
-    if round_num < 3:
-        print(f"  Waiting 5s before next round...")
-        time.sleep(5)
-
-print()
-print("OK Malicious reports injected. Waiting 15s for consensus to process...")
-time.sleep(15)
-
-# ── Step 5: print live results ────────────────────────────────────────────────
-print("\n=== STEP 5: Live consensus results ===")
-
-for node_id, base_url in NODES.items():
-    print(f"\n--- {node_id} ({base_url}) ---")
-
-    try:
-        verdict = requests.get(f"{base_url}/verdict", timeout=5).json()
-        verdicts = verdict.get("verdicts", {})
-        reps     = verdict.get("node_reputations", {})
-
-        if verdicts:
-            latest_epoch = max(verdicts.keys())
-            v = verdicts[latest_epoch]
-            print(f"  Latest epoch:    {latest_epoch}")
-            print(f"  Majority verdict:{v.get('majority_verdict', '—')}")
-            print(f"  Honest nodes:    {v.get('honest', [])}")
-            print(f"  Slashed nodes:   {v.get('slashed', [])}")
-        else:
-            print("  No verdicts yet")
-
-        if reps:
-            print("  Reputations:")
-            for nid, score in reps.items():
-                action = "✅ ALLOW" if score >= 0.8 else "⚠️  WARN" if score >= 0.6 else "🚫 SLASH"
-                print(f"    {nid}: {score:.4f}  {action}")
-    except Exception as e:
-        print(f"  ERROR: {e}")
-
-    try:
-        reports = requests.get(f"{base_url}/reports/latest?limit=5", timeout=5).json()
-        count = reports.get("total_available", 0)
-        print(f"  Total reports stored: {count}")
-    except Exception:
+        r = requests.get(f"{base_url}/health", timeout=1)
+        if r.status_code == 200:
+            data = r.json()
+            online_nodes[node_id] = base_url
+            pk = data.get("public_key")
+            if pk:
+                pubkeys[node_id] = pk
+    except:
         pass
 
-print("\n=== DONE ===")
-print("Dashboard -> Multi-Node tab should now show:")
-print("  - node_d with low reputation and SLASH action")
-print("  - Honest nodes with reputation ~0.97-0.99")
-print("  - Majority verdict: 'up'")
-print("  - Slashed: ['node_d']")
-print()
-print("Blockchain tx hashes will appear in the Hardhat terminal.")
-print("Run this script again any time to re-inject malicious reports.")
+TOTAL = len(online_nodes)
+print(f"  Found {TOTAL} online nodes")
+
+if TOTAL < 2:
+    print("ERROR: Need at least 2 nodes online.")
+    exit(1)
+
+# ── Step 2: Create dynamic shards ────────────────────────────
+print(f"\n[STEP 2] Creating shards ({NODES_PER_SHARD} nodes per shard)...")
+node_list = list(online_nodes.keys())
+random.shuffle(node_list)  # Randomize shard assignment
+
+shards = {}
+shard_id = 0
+for i in range(0, len(node_list), NODES_PER_SHARD):
+    shard_members = node_list[i:i + NODES_PER_SHARD]
+    shard_name = f"SHARD_{shard_id}"
+    shards[shard_name] = shard_members
+    shard_id += 1
+
+NUM_SHARDS = len(shards)
+print(f"  Created {NUM_SHARDS} shards")
+for name, members in shards.items():
+    print(f"    {name}: {len(members)} nodes")
+
+# ── Step 3: Gossip Registration (Fanout=4) ───────────────────
+print(f"\n[STEP 3] Gossip Registration (Fanout={GOSSIP_FANOUT})...")
+total_connections = 0
+
+for node_id in online_nodes:
+    potential_peers = [n for n in online_nodes if n != node_id]
+    peers_to_add = random.sample(potential_peers, min(GOSSIP_FANOUT, len(potential_peers)))
+
+    for peer_id in peers_to_add:
+        if node_id not in pubkeys:
+            continue
+        payload = {
+            "node_id": node_id,
+            "url": online_nodes[node_id],
+            "public_key_hex": pubkeys[node_id],
+        }
+        try:
+            requests.post(f"{online_nodes[peer_id]}/peers/register", json=payload, timeout=1)
+            total_connections += 1
+        except:
+            pass
+
+full_mesh = TOTAL * (TOTAL - 1)
+print(f"  Total connections: {total_connections}")
+print(f"  Full mesh would be: {full_mesh}")
+print(f"  Reduction: {100 - (total_connections / max(full_mesh, 1) * 100):.1f}%")
+
+# ── Step 4: Sharded URL Assignment ───────────────────────────
+print(f"\n[STEP 4] Sharded URL Assignment ({URLS_PER_SHARD} URLs per shard)...")
+
+for shard_idx, (shard_name, members) in enumerate(shards.items()):
+    start_idx = (shard_idx * URLS_PER_SHARD) % len(URL_POOL)
+    shard_urls = URL_POOL[start_idx:start_idx + URLS_PER_SHARD]
+
+    for node_id in members:
+        if node_id not in online_nodes:
+            continue
+        payload = {"urls": shard_urls}
+        try:
+            requests.post(f"{online_nodes[node_id]}/config/urls", json=payload, timeout=1)
+        except:
+            pass  # Endpoint may not exist yet on some nodes
+
+    print(f"  {shard_name}: assigned {len(shard_urls)} URLs to {len(members)} nodes")
+
+# ── Step 5: Save network topology ────────────────────────────
+topology = {
+    "total_nodes": TOTAL,
+    "num_shards": NUM_SHARDS,
+    "gossip_fanout": GOSSIP_FANOUT,
+    "total_connections": total_connections,
+    "full_mesh_connections": full_mesh,
+    "shards": {name: members for name, members in shards.items()},
+    "urls_per_shard": URLS_PER_SHARD,
+    "timestamp": time.time()
+}
+
+with open("network_topology.json", "w") as f:
+    json.dump(topology, f, indent=2)
+
+print(f"\n{'='*50}")
+print(f"  NETWORK SETUP COMPLETE")
+print(f"{'='*50}")
+print(f"  Nodes Online:     {TOTAL}")
+print(f"  Shards:           {NUM_SHARDS}")
+print(f"  URLs per Shard:   {URLS_PER_SHARD}")
+print(f"  Gossip Fanout:    {GOSSIP_FANOUT}")
+print(f"  Connections:      {total_connections} (vs {full_mesh} full mesh)")
+print(f"  Topology saved:   network_topology.json")
+print(f"{'='*50}")

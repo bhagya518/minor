@@ -436,44 +436,50 @@ class PeerClient:
         logger.info(f"Broadcast completed: {sum(results.values())}/{len(results)} successful")
         return results
     
-    # Phase 2: Broadcast signed monitoring report using gossip-style fanout
+    # Phase 2: Broadcast signed monitoring report using sharded gossip fanout
     async def broadcast_report(self, report: 'MonitoringReport', peer_urls: List[str]) -> Dict[str, bool]:
         """
-        Broadcast a signed MonitoringReport to a subset of peers using gossip-style fanout
-        Instead of sending to all peers (O(N)), we send to a random subset (fanout=3) for O(log N) scalability.
-        
-        Args:
-            report: Signed MonitoringReport to broadcast
-            peer_urls: List of peer URLs (e.g., ["http://localhost:8001", "http://localhost:8002"])
-            
-        Returns:
-            Dictionary mapping peer_url to success status
+        Broadcast a signed MonitoringReport to a subset of peers using Sharded Gossip.
+        Prioritizes peers in the same shard, with a bridge to other shards.
         """
-        logger.info(f"broadcast_report called with {len(peer_urls)} peers: {peer_urls}")
+        logger.info(f"broadcast_report called with {len(peer_urls)} peers")
         
-        if not REPORT_AVAILABLE:
-            logger.warning("MonitoringReport not available, cannot broadcast")
+        if not REPORT_AVAILABLE or not peer_urls:
             return {}
-        
-        if not peer_urls:
-            logger.warning("No peer URLs provided - nothing to broadcast")
-            return {}
-        
-        # Convert report to dictionary for JSON serialization
+
         payload = asdict(report)
-        
         results = {}
         
-        # GOSSIP-STYLE FANOUT: Select random subset of peers instead of all
-        FANOUT = min(PeerConfig.FANOUT, len(peer_urls))
+        # ── SHARDING LOGIC ──
+        # Simple sharding: 5 nodes per shard (a-e, f-j, k-o, p-t)
+        def get_shard_id(url: str) -> int:
+            try:
+                # Extract node letter from port or URL (port 8005=a, 8006=b...)
+                port = int(url.split(":")[-1].replace("/", ""))
+                return (port - 8005) // 5
+            except: return 0
+
+        our_shard = get_shard_id(f"http://localhost:{self.port}")
         
-        if len(peer_urls) > FANOUT:
-            import random
-            selected_urls = random.sample(peer_urls, FANOUT)
-        else:
-            selected_urls = peer_urls
+        shard_peers = [u for u in peer_urls if get_shard_id(u) == our_shard]
+        external_peers = [u for u in peer_urls if get_shard_id(u) != our_shard]
         
-        logger.info(f"Gossip-style report broadcast: sending to {len(selected_urls)}/{len(peer_urls)} peers (fanout={FANOUT})")
+        # Gossip Fanout Selection:
+        # Pick 2 peers from same shard + 1 peer from a different shard (The "Bridge")
+        selected_urls = []
+        import random
+        
+        if shard_peers:
+            selected_urls.extend(random.sample(shard_peers, min(2, len(shard_peers))))
+        if external_peers:
+            selected_urls.extend(random.sample(external_peers, min(1, len(external_peers))))
+            
+        # Fallback if shards are empty
+        if not selected_urls and peer_urls:
+            selected_urls = random.sample(peer_urls, min(3, len(peer_urls)))
+
+        logger.info(f"Sharded Gossip: shard={our_shard} | local={len(shard_peers)} | ext={len(external_peers)}")
+        logger.info(f"Selected Targets: {selected_urls}")
         
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=PeerConfig.REPORT_TIMEOUT),
