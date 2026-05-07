@@ -22,6 +22,7 @@ def run_scaling_benchmark():
     node_counts = [10, 50, 100, 150, 200, 250, 300]
     node_scaling_data = []
     total_pipeline_latencies = []
+    node_max_capacities = []
     
     print("🚀 STARTING: High-Fidelity Scaling Benchmark (Nodes 10 -> 300)...")
     
@@ -62,13 +63,14 @@ def run_scaling_benchmark():
             "max_capacity_rps": round(max_capacity_rps, 2)
         })
         total_pipeline_latencies.append(total_latency)
+        node_max_capacities.append(max_capacity_rps)
         
         print(f"   [Nodes: {n:3}] Latency: {total_latency:7.2f}ms | Max Capacity: {max_capacity_rps:7.1f} RPS")
 
     # 2. LOAD SCALING DATA (Fixed 200 Nodes)
     url_loads = [5, 10, 25, 50, 100, 200]
     load_scaling_data = []
-    throughput_rps = []
+    load_max_capacities = []
     
     print("\n🚀 STARTING: Realistic Load Capacity Test (at 200 Nodes)...")
     for u in url_loads:
@@ -100,7 +102,7 @@ def run_scaling_benchmark():
             "epoch_throughput_rps": round(epoch_rps, 2),
             "max_capacity_rps": round(max_capacity_rps, 2)
         })
-        throughput_rps.append(epoch_rps) # Graph still uses epoch RPS for realistic leveling
+        load_max_capacities.append(max_capacity_rps) 
         print(f"   [URLs/Node: {u:3}] Pipeline: {estimated_pipeline:7.1f}ms | Max Capacity: {max_capacity_rps:7.1f} RPS")
 
     # --- 3. SAVE DATA ANALYSIS FILES ---
@@ -142,14 +144,25 @@ def run_scaling_benchmark():
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.savefig('scaling_latency_300.png', dpi=300, bbox_inches='tight')
     
-    # Graph 2: Throughput Scaling
+    # Graph 2: Max Capacity vs Nodes
     plt.figure(figsize=(10, 6))
-    plt.plot(url_loads, throughput_rps, marker='s', linewidth=3, color='#3399ff', label='Network Throughput')
-    plt.fill_between(url_loads, throughput_rps, color='#3399ff', alpha=0.1)
+    plt.plot(node_counts, node_max_capacities, marker='d', linewidth=3, color='#ff9900', label='Max Theoretical Capacity')
+    plt.fill_between(node_counts, node_max_capacities, color='#ff9900', alpha=0.1)
+    plt.title('System Capacity Scaling (10 to 300 Nodes)', fontsize=14, fontweight='bold', pad=20)
+    plt.xlabel('Number of Active Nodes', fontsize=12)
+    plt.ylabel('Max Capacity (Reports/sec)', fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.savefig('scaling_capacity_nodes_300.png', dpi=300, bbox_inches='tight')
+    
+    # Graph 3: Throughput vs Load (using Max Capacity)
+    plt.figure(figsize=(10, 6))
+    plt.plot(url_loads, load_max_capacities, marker='s', linewidth=3, color='#3399ff', label='Max Capacity Under Load')
+    plt.fill_between(url_loads, load_max_capacities, color='#3399ff', alpha=0.1)
     
     plt.title('System Throughput Capacity (200 Nodes)', fontsize=14, fontweight='bold', pad=20)
     plt.xlabel('URLs Monitored Per Node', fontsize=12)
-    plt.ylabel('Throughput (Reports Per Second)', fontsize=12)
+    plt.ylabel('Max Capacity (Reports/sec)', fontsize=12)
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.savefig('scaling_throughput_200.png', dpi=300, bbox_inches='tight')
