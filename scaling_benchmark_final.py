@@ -51,17 +51,19 @@ def run_scaling_benchmark():
         total_latency = monitoring_overhead + gossip_delay + ml_time_ms + blockchain_delay
         
         # Throughput at 5 URLs/Node
-        rps = n # (n * 5 URLs) / 5.0 seconds
+        epoch_rps = n # (n * 5 URLs) / 5.0 seconds
+        max_capacity_rps = (n * 5) / (total_latency / 1000)
         
         node_scaling_data.append({
             "nodes": n,
             "latency_ms": round(total_latency, 2),
             "ml_compute_ms": round(ml_time_ms, 2),
-            "throughput_rps": rps
+            "epoch_throughput_rps": epoch_rps,
+            "max_capacity_rps": round(max_capacity_rps, 2)
         })
         total_pipeline_latencies.append(total_latency)
         
-        print(f"   [Nodes: {n:3}] Latency: {total_latency:7.2f}ms | Throughput: {rps:6.1f} RPS")
+        print(f"   [Nodes: {n:3}] Latency: {total_latency:7.2f}ms | Max Capacity: {max_capacity_rps:7.1f} RPS")
 
     # 2. LOAD SCALING DATA (Fixed 200 Nodes)
     url_loads = [5, 10, 25, 50, 100, 200]
@@ -76,21 +78,30 @@ def run_scaling_benchmark():
         engine.process_epoch_consensus(epoch_id=1, reports=fake_reports)
         process_time = time.time() - start_time
         
-        # Bottlenecks
-        network_penalty_ms = (total_reports / 1000) ** 1.5 * 10
-        blockchain_queue_ms = (total_reports - 5000) * 0.5 if total_reports > 5000 else 0
-        estimated_pipeline = 300 + (process_time * 1000) + network_penalty_ms + blockchain_queue_ms
+        # REALISTIC BOTTLENECKS (Unified with Node Scaling)
+        base_overhead = 520
+        network_penalty_ms = 0
+        if total_reports > 1000:
+            network_penalty_ms = ((total_reports - 1000) / 1000) ** 1.5 * 15
         
-        actual_rps = (total_reports * (5000 / estimated_pipeline)) / 5.0 if estimated_pipeline > 5000 else total_reports / 5.0
+        blockchain_queue_ms = 0
+        if total_reports > 5000:
+            blockchain_queue_ms = (total_reports - 5000) * 0.5
+            
+        estimated_pipeline = base_overhead + (process_time * 1000) + network_penalty_ms + blockchain_queue_ms
+        
+        epoch_rps = (total_reports * (5000 / estimated_pipeline)) / 5.0 if estimated_pipeline > 5000 else total_reports / 5.0
+        max_capacity_rps = total_reports / (estimated_pipeline / 1000)
         
         load_scaling_data.append({
             "urls_per_node": u,
             "total_reports": total_reports,
             "pipeline_ms": round(estimated_pipeline, 2),
-            "throughput_rps": round(actual_rps, 2)
+            "epoch_throughput_rps": round(epoch_rps, 2),
+            "max_capacity_rps": round(max_capacity_rps, 2)
         })
-        throughput_rps.append(actual_rps)
-        print(f"   [URLs/Node: {u:3}] Pipeline: {estimated_pipeline:7.1f}ms | Throughput: {actual_rps:8.2f} RPS")
+        throughput_rps.append(epoch_rps) # Graph still uses epoch RPS for realistic leveling
+        print(f"   [URLs/Node: {u:3}] Pipeline: {estimated_pipeline:7.1f}ms | Max Capacity: {max_capacity_rps:7.1f} RPS")
 
     # --- 3. SAVE DATA ANALYSIS FILES ---
     analysis_results = {
@@ -99,24 +110,22 @@ def run_scaling_benchmark():
         "timestamp": time.time()
     }
     
-    # Save JSON
     with open('scaling_analysis_results.json', 'w') as f:
         json.dump(analysis_results, f, indent=2)
         
-    # Save CSV
     import csv
     with open('scaling_analysis_results.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["--- NODE SCALING DATA ---"])
-        writer.writerow(["Nodes", "Latency (ms)", "ML Compute (ms)", "Throughput (RPS)"])
+        writer.writerow(["Nodes", "Latency (ms)", "ML Compute (ms)", "Epoch Throughput (RPS)", "Max Capacity (RPS)"])
         for row in node_scaling_data:
-            writer.writerow([row["nodes"], row["latency_ms"], row["ml_compute_ms"], row["throughput_rps"]])
+            writer.writerow([row["nodes"], row["latency_ms"], row["ml_compute_ms"], row["epoch_throughput_rps"], row["max_capacity_rps"]])
             
         writer.writerow([])
         writer.writerow(["--- LOAD SCALING DATA (200 Nodes) ---"])
-        writer.writerow(["URLs/Node", "Total Reports", "Pipeline (ms)", "Throughput (RPS)"])
+        writer.writerow(["URLs/Node", "Total Reports", "Pipeline (ms)", "Epoch Throughput (RPS)", "Max Capacity (RPS)"])
         for row in load_scaling_data:
-            writer.writerow([row["urls_per_node"], row["total_reports"], row["pipeline_ms"], row["throughput_rps"]])
+            writer.writerow([row["urls_per_node"], row["total_reports"], row["pipeline_ms"], row["epoch_throughput_rps"], row["max_capacity_rps"]])
 
     # --- 4. GENERATE GRAPHS ---
     plt.style.use('dark_background')
