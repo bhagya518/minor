@@ -162,39 +162,21 @@ async def startup_event():
     global blockchain_client, live_ml, ml_consensus, node_config, epoch_manager
     global monitoring_task, heartbeat_task, cleanup_task, blockchain_write_queue, blockchain_write_task
 
-    # Parse command line arguments at startup (needed for --peers flag)
-    args = parser.parse_args()
+    # Parse command line arguments at startup (ignore uvicorn-specific args)
+    args, unknown = parser.parse_known_args()
     
     try:
         logger.info("Starting up monitoring node...")
         
-        # Get command line arguments
-        import sys
-        port = 8000
-        node_id = f"node_{port}"
-        websites = ["https://google.com", "https://github.com", "https://httpbin.org"]
-        peers = []
+        # Get configuration from Environment or Args
+        import os
+        port = int(os.getenv("PORT", args.port))
+        node_id = os.getenv("NODE_ID", args.node_id or f"node_{port}")
+        node_mode = os.getenv("NODE_MODE", "honest")
         
-        # Parse sys.argv for arguments
-        for i, arg in enumerate(sys.argv):
-            if arg == "--port" and i + 1 < len(sys.argv):
-                port = int(sys.argv[i + 1])
-            elif arg == "--node-id" and i + 1 < len(sys.argv):
-                node_id = sys.argv[i + 1]
-            elif arg == "--websites" and i + 1 < len(sys.argv):
-                # Collect all website arguments until next flag
-                websites = []
-                j = i + 1
-                while j < len(sys.argv) and not sys.argv[j].startswith("--"):
-                    websites.append(sys.argv[j])
-                    j += 1
-            elif arg == "--peers" and i + 1 < len(sys.argv):
-                # Collect all peer arguments until next flag
-                peers = []
-                j = i + 1
-                while j < len(sys.argv) and not sys.argv[j].startswith("--"):
-                    peers.append(sys.argv[j])
-                    j += 1
+        # Determine websites to monitor
+        websites = args.websites
+        peers = args.peers or []
         
         # Load configuration
         node_config = NodeConfig(
