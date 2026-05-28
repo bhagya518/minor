@@ -55,6 +55,11 @@ class EnhancedMLConsensusEngine:
         self.alpha = alpha  # EWMA smoothing factor
         self.iso_contamination = iso_contamination
         
+        # History buffers
+        self.node_latency_history = defaultdict(list)
+        self.node_failure_history = defaultdict(list)
+        self.history_window_size = 50
+        
         # ML Models (ML_MINOR approach)
         self.rf_model = None
         self.iso_model = None
@@ -591,7 +596,7 @@ class EnhancedMLConsensusEngine:
         features_to_predict = []
         for sender_id in all_node_ids:
             sender_reports = reports_by_sender[sender_id]
-            features = self._extract_features_from_reports(sender_reports, all_reports_context=reports)
+            features = self._extract_features_from_reports(sender_id, sender_reports, all_reports_context=reports)
             features['collusion_score'] = 0.0
             features_to_predict.append(features)
         
@@ -642,84 +647,57 @@ class EnhancedMLConsensusEngine:
         
         return results
 
-    def _extract_features_from_reports(self, sender_reports: List[Dict], all_reports_context: List[Dict] = None) -> Dict:
-        """Extract features from node reports for ML evaluation (internal method)"""
+
+        """Extract 8 statistical latency and failure features for ML consensus.
+        Uses rolling history buffers (window size self.history_window_size) to compute statistics.
+        Returns a dict with keys: avg_latency, latency_variance, std_latency, skewness, kurtosis, p95_latency, max_latency, failure_rate.
+        """
         if not sender_reports:
             return {}
-        
-        sender_id = None
-        for r in sender_reports:
-            sender_id = r.get("node_address") or r.get("sender_id") or r.get("node_id") or r.get("received_from")
-            if sender_id:
-                break
-        
-        # peer_agreement_rate: does this sender agree with the majority?
-        agreement_scores = []
-        for r in sender_reports:
-            url = r.get("url")
-            our_reachable = r.get("is_reachable")
-            
-            if all_reports_context and url is not None and our_reachable is not None:
-                # Get all other nodes' votes for this URL
-                peer_votes = []
-                for p in all_reports_context:
-                    peer_sender = p.get("node_address") or p.get("sender_id") or p.get("node_id") or p.get("received_from")
-                    if (p.get("url") == url and 
-                        peer_sender != sender_id and 
-                        p.get("is_reachable") is not None):
-                        peer_votes.append(p.get("is_reachable"))
-                
-                if peer_votes:
-                    # Majority vote (True if >50% say reachable)
-                    majority_reachable = sum(peer_votes) / len(peer_votes) > 0.5
-                    agreement_scores.append(1.0 if our_reachable == majority_reachable else 0.0)
-        
-        peer_agreement_rate = sum(agreement_scores) / len(agreement_scores) if agreement_scores else 0.5
-        
-        # Calculate other features from sender's reports
-        total_reports = len(sender_reports)
-        reachable_count = sum(1 for r in sender_reports if r.get("is_reachable", True))
-        response_times = [r.get("response_ms", r.get("response_time_ms", 0)) for r in sender_reports if r.get("response_ms") or r.get("response_time_ms")]
-        ssl_valid_count = sum(1 for r in sender_reports if r.get("ssl_valid", True))
-        
-        # Calculate aggregate metrics
-        avg_response_time = float(np.mean(response_times)) if response_times else 0.0
-        max_response_time = float(max(response_times)) if response_times else 0.0
-        success_rate = reachable_count / total_reports if total_reports > 0 else 0.5
-        ssl_accuracy = ssl_valid_count / total_reports if total_reports > 0 else 1.0
-        
-        # Calculate variance in response times (consistency measure)
-        if len(response_times) > 1:
-            rt_variance = float(np.var(response_times))
-            rt_std = float(np.std(response_times))
+
+        # Extract latency values from current reports
+        current_latencies = [r.get("response_ms") or r.get("response_time_ms") for r in sender_reports if r.get("response_ms") or r.get("response_time_ms")]
+        # Failure indicator (1 if not reachable, else 0)
+        current_failures = [0 if r.get("is_reachable", True) else 1 for r in sender_reports]
+
+        # Update rolling latency history
+        latency_hist = self.node_latency_history[sender_id]
+        latency_hist.extend(current_latencies)
+        if len(latency_hist) > self.history_window_size:
+            del latency_hist[:len(latency_hist) - self.history_window_size]
+
+        # Update rolling failure history
+        failure_hist = self.node_failure_history[sender_id]
+        failure_hist.extend(current_failures)
+        if len(failure_hist) > self.history_window_size:
+            del failure_hist[:len(failure_hist) - self.history_window_size]
+
+        # Compute statistics from history (fallback to current if history empty)
+        if latency_hist:
+            series = pd.Series(latency_hist)
+            avg_latency = series.mean()
+            latency_variance = series.var()
+            std_latency = series.std()
+            skewness = series.skew()
+            kurtosis = series.kurt()
+            p95_latency = np.percentile(series, 95)
+            max_latency = series.max()
         else:
-            rt_variance = 0.0
-            rt_std = 0.0
-        
-        # Calculate itt_jitter: variance between consecutive report timestamps
-        timestamps = sorted([r.get("timestamp", 0) for r in sender_reports if r.get("timestamp")])
-        if len(timestamps) > 1:
-            itts = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-            itt_jitter = float(np.std(itts)) / (float(np.mean(itts)) + 1e-6)
-            itt_jitter = min(itt_jitter, 1.0)
-        else:
-            itt_jitter = 0.1  # single report — assume normal
-        
-        # Fixed feature extraction to match ML model expectations (11 features only)
+            avg_latency = latency_variance = std_latency = skewness = kurtosis = p95_latency = max_latency = 0.0
+
+        failure_rate = float(sum(failure_hist) / len(failure_hist)) if failure_hist else 0.0
+
         features = {
-            "accuracy": success_rate,
-            "false_positive_rate": max(0.0, 1.0 - success_rate - 0.1) if success_rate > 0.5 else 0.0,
-            "false_negative_rate": max(0.0, 1.0 - success_rate) if success_rate <= 0.5 else 0.0,
-            "avg_rt_error": min(avg_response_time / 1000.0, 1.0),  # Normalize to seconds
-            "peer_agreement_rate": peer_agreement_rate,
-            "report_consistency": 1.0 - min(rt_variance / 1000000.0, 1.0) if response_times else 0.5,
-            "sudden_change_score": 0.3 if success_rate > 0.8 else 0.7,  # Will be enhanced with historical tracking
-            "ssl_accuracy": ssl_accuracy,
-            "uptime_deviation": abs(success_rate - 0.99),  # Deviation from ideal uptime
-            "rt_consistency": 1.0 - min(rt_std / 1000.0, 1.0) if response_times else 0.5,
-            "itt_jitter": itt_jitter,  # ADDED: Inter-transmission time jitter
+            "avg_latency": float(avg_latency),
+            "latency_variance": float(latency_variance),
+            "std_latency": float(std_latency),
+            "skewness": float(skewness),
+            "kurtosis": float(kurtosis),
+            "p95_latency": float(p95_latency),
+            "max_latency": float(max_latency),
+            "failure_rate": float(failure_rate),
         }
-        
+
         logger.debug(f"Features for sender {sender_id}: {features}")
         return features
 
@@ -760,3 +738,32 @@ class EnhancedMLConsensusEngine:
             return min(centrality * 2.0, 1.0)
         except:
             return 0.0
+
+class MLConsensusEngine(EnhancedMLConsensusEngine):
+    """Compatibility wrapper for legacy imports."""
+
+    def load_ensemble_models(self) -> None:
+        """Legacy alias to load enhanced models."""
+        self.load_enhanced_models()
+
+    def predict_malicious_probability(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Legacy wrapper for prediction.
+
+        Takes a DataFrame where each row is a feature set, computes the enhanced
+        reputation (probability of *honest*) via `calculate_enhanced_reputation`,
+        then returns a DataFrame with a single column `p_malicious` representing
+        the probability of being malicious (i.e. 1 - reputation).
+        """
+        if features_df.empty:
+            return pd.DataFrame(columns=["p_malicious"])
+        # Compute reputation for each row
+        reputations = [
+            self.calculate_enhanced_reputation(row.to_dict())
+            for _, row in features_df.iterrows()
+        ]
+        # Convert to malicious probability
+        malicious = [1.0 - r for r in reputations]
+        return pd.DataFrame({"p_malicious": malicious})
+
+    pass

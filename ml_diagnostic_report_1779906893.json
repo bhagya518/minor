@@ -1,0 +1,41 @@
+{
+  "timestamp": 1779906893.8095012,
+  "models": {
+    "rf_model.pkl": {
+      "status": "NOT_REQUIRED",
+      "description": "Random Forest"
+    },
+    "iso_model.pkl": {
+      "status": "NOT_REQUIRED",
+      "description": "Isolation Forest"
+    },
+    "gb_meta_model.pkl": {
+      "status": "NOT_REQUIRED",
+      "description": "Meta Learner"
+    },
+    "scaler.pkl": {
+      "status": "NOT_REQUIRED",
+      "description": "Feature Scaler"
+    },
+    "feature_cols.json": {
+      "status": "NOT_REQUIRED",
+      "description": "Feature Columns"
+    },
+    "rf_backbone.joblib": {
+      "status": "OK",
+      "type": "<class 'sklearn.ensemble._forest.RandomForestClassifier'>",
+      "description": "ML_MINOR Random Forest",
+      "features": 11
+    },
+    "iso_backbone.joblib": {
+      "status": "OK",
+      "type": "<class 'sklearn.ensemble._iforest.IsolationForest'>",
+      "description": "ML_MINOR Isolation Forest",
+      "features": 0
+    }
+  },
+  "feature_extraction": true,
+  "ml_prediction": true,
+  "enhanced_engine": true,
+  "active_nodes": []
+}

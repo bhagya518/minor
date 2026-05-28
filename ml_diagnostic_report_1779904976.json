@@ -1,0 +1,37 @@
+{
+  "timestamp": 1779904976.3840506,
+  "models": {
+    "rf_model.pkl": {
+      "status": "MISSING",
+      "description": "Random Forest"
+    },
+    "iso_model.pkl": {
+      "status": "MISSING",
+      "description": "Isolation Forest"
+    },
+    "gb_meta_model.pkl": {
+      "status": "MISSING",
+      "description": "Meta Learner"
+    },
+    "scaler.pkl": {
+      "status": "MISSING",
+      "description": "Feature Scaler"
+    },
+    "feature_cols.json": {
+      "status": "MISSING",
+      "description": "Feature Columns"
+    },
+    "rf_backbone.joblib": {
+      "status": "MISSING",
+      "description": "ML_MINOR Random Forest"
+    },
+    "iso_backbone.joblib": {
+      "status": "MISSING",
+      "description": "ML_MINOR Isolation Forest"
+    }
+  },
+  "feature_extraction": false,
+  "ml_prediction": false,
+  "enhanced_engine": false,
+  "active_nodes": []
+}
