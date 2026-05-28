@@ -450,14 +450,16 @@ class PeerClient:
         payload = asdict(report)
         results = {}
         
-        # ── SHARDING LOGIC ──
-        # Simple sharding: 5 nodes per shard (a-e, f-j, k-o, p-t)
-        def get_shard_id(url: str) -> int:
+        # ── DYNAMIC SHARDING LOGIC ──
+        # Consistent hashing for shard assignment (prevents infinite migration loops)
+        def get_shard_id(url: str, num_shards: int = 4) -> int:
             try:
-                # Extract node letter from port or URL (port 8005=a, 8006=b...)
-                port = int(url.split(":")[-1].replace("/", ""))
-                return (port - 8005) // 5
-            except: return 0
+                # Use SHA-256 for consistent hashing
+                import hashlib
+                hash_val = int(hashlib.sha256(url.encode()).hexdigest(), 16)
+                return hash_val % num_shards
+            except Exception: 
+                return 0
 
         our_shard = get_shard_id(f"http://localhost:{self.port}")
         

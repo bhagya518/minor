@@ -26,16 +26,16 @@ try:
     import aiosqlite
     SQLITE_AVAILABLE = True
 except ImportError:
-    import sqlite3
-    SQLITE_AVAILABLE = False
     aiosqlite = None
+    SQLITE_AVAILABLE = False
+import sqlite3
 import json
 import os
 import hashlib
 
 # Import signature verification
 try:
-    from src.monitoring_report import ReportVerifier
+    from .monitoring_report import ReportVerifier
     VERIFIER_AVAILABLE = True
 except ImportError:
     VERIFIER_AVAILABLE = False
@@ -59,6 +59,7 @@ class EpochManager:
         self.current_epoch = 0
         self.epoch_reports = defaultdict(list)  # epoch_id -> list of reports
         self.own_reports = {}  # epoch_id -> own report
+        self.submitted_epochs = set()  # track locally submitted epochs to prevent duplicate submission
         
         # Consensus results
         self.epoch_decisions = {}  # epoch_id -> decision
@@ -66,6 +67,7 @@ class EpochManager:
         
         # Configuration
         self.epoch_duration = 5  # seconds
+        self.epoch_verdicts = {}  # Initialize epoch verdicts dict
         self.min_peers_for_quorum = 1  # need reports from at least 1 other node (reduced for testing)
         self.quorum_threshold = 2/3  # 2/3 majority required
         self.consensus_timeout = 2  # seconds to wait for quorum before proceeding
@@ -344,72 +346,7 @@ class EpochManager:
         """Get current epoch number"""
         return int(time.time() // self.epoch_duration)
     
-    def _elect_leader(self, epoch_id: int) -> str:
-        """
-        Elect leader for given epoch based on reputation scores
-        Highest reputation node becomes leader (ties broken by deterministic hash)
-        
-        Args:
-            epoch_id: Epoch identifier
-            
-        Returns:
-            Selected leader node_id
-        """
-        # Get all known nodes with their reputation scores
-        node_reputations = {}
-        
-        # Add self with current reputation
-        self_reputation = self.ewma_reputations.get(self.node_id, 0.5)
-        node_reputations[self.node_id] = self_reputation
-        
-        # Add nodes from recent reports with their reputations
-        recent_epoch = epoch_id - 1
-        if recent_epoch in self.epoch_reports:
-            for report in self.epoch_reports[recent_epoch]:
-                node_id = report.get("node_address", report.get("node_id"))
-                if node_id and node_id not in node_reputations:
-                    # Get reputation from ML consensus engine or default
-                    reputation = 0.5  # Default reputation
-                    if self.ml_consensus_engine:
-                        reputation = self.ml_consensus_engine.ewma_reputations.get(node_id, 0.5)
-                    node_reputations[node_id] = reputation
-        
-        if not node_reputations:
-            return self.node_id
-        
-        # Find node with highest reputation
-        max_reputation = max(node_reputations.values())
-        top_nodes = [node_id for node_id, rep in node_reputations.items() if rep == max_reputation]
-        
-        selected_leader = None
-        
-        if len(top_nodes) == 1:
-            # Clear winner - highest reputation
-            selected_leader = top_nodes[0]
-        else:
-            # Tie breaker: use deterministic hash among top nodes
-            import hashlib
-            sorted_top_nodes = sorted(top_nodes)
-            hash_input = f"{epoch_id}:{len(sorted_top_nodes)}"
-            hash_value = int(hashlib.sha256(hash_input.encode()).hexdigest(), 16)
-            leader_index = hash_value % len(sorted_top_nodes)
-            selected_leader = sorted_top_nodes[leader_index]
-        
-        # Update leader state
-        self.current_leader = selected_leader
-        self.is_leader = (selected_leader == self.node_id)
-        self.leader_history[epoch_id] = selected_leader
-        
-        # Log reputation-based election
-        logger.info(f"Epoch {epoch_id}: Reputation-based leader election")
-        logger.info(f"  Selected leader: {selected_leader} (reputation: {node_reputations[selected_leader]:.3f})")
-        logger.info(f"  Is this node leader: {self.is_leader}")
-        
-        # Log top 3 nodes for transparency
-        sorted_nodes = sorted(node_reputations.items(), key=lambda x: x[1], reverse=True)
-        logger.info(f"  Top reputations: {sorted_nodes[:3]}")
-        
-        return selected_leader
+
     
     def _should_rotate_leader(self, epoch_id: int) -> bool:
         """
@@ -880,17 +817,31 @@ class EpochManager:
         # Step 8: THEN submit to blockchain
         if self.is_leader and self.blockchain_client:
             try:
-                logger.info(f"Epoch {epoch_id}: Leader submitting decision to blockchain (source of truth)")
-                
-                blockchain_result = await self.blockchain_client.submit_epoch_decision(epoch_id, decision)
-                
-                if blockchain_result['success']:
-                    logger.info(f"Epoch {epoch_id}: Decision committed to blockchain - consensus finalized")
+                # 1. Local guard
+                if hasattr(self, 'submitted_epochs') and epoch_id in self.submitted_epochs:
+                    logger.info(f"Epoch {epoch_id}: Decision already submitted locally, skipping duplicate submission.")
                     decision['blockchain_committed'] = True
-                    decision['blockchain_tx'] = blockchain_result.get('tx_hash')
                 else:
-                    logger.warning(f"Epoch {epoch_id}: Failed to commit to blockchain: {blockchain_result.get('error')}")
-                    decision['blockchain_committed'] = False
+                    # 2. On-chain guard
+                    on_chain_status = await self.blockchain_client.get_epoch_decision(epoch_id)
+                    if on_chain_status.get('success') and on_chain_status.get('submitted'):
+                        logger.info(f"Epoch {epoch_id}: Decision already submitted on-chain, skipping duplicate submission.")
+                        if hasattr(self, 'submitted_epochs'):
+                            self.submitted_epochs.add(epoch_id)
+                        decision['blockchain_committed'] = True
+                    else:
+                        logger.info(f"Epoch {epoch_id}: Leader submitting decision to blockchain (source of truth)")
+                        blockchain_result = await self.blockchain_client.submit_epoch_decision(epoch_id, decision)
+                        
+                        if blockchain_result['success']:
+                            logger.info(f"Epoch {epoch_id}: Decision committed to blockchain - consensus finalized")
+                            decision['blockchain_committed'] = True
+                            decision['blockchain_tx'] = blockchain_result.get('tx_hash')
+                            if hasattr(self, 'submitted_epochs'):
+                                self.submitted_epochs.add(epoch_id)
+                        else:
+                            logger.warning(f"Epoch {epoch_id}: Failed to commit to blockchain: {blockchain_result.get('error')}")
+                            decision['blockchain_committed'] = False
             except Exception as e:
                 logger.error(f"Epoch {epoch_id}: Error submitting to blockchain: {e}")
                 decision['blockchain_committed'] = False

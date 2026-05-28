@@ -28,20 +28,30 @@ print("\n[STEP 1] Discovering online nodes...")
 online_nodes = {}
 pubkeys = {}
 
+# Wait a few seconds for nodes to fully start their FastAPI servers
+print("  Waiting for nodes to initialize...")
+time.sleep(5)
+
 for i in range(MAX_NODES):
     port = BASE_PORT + i
-    node_id = f"node_{i}"
     base_url = f"http://localhost:{port}"
-    try:
-        r = requests.get(f"{base_url}/health", timeout=1)
-        if r.status_code == 200:
-            data = r.json()
-            online_nodes[node_id] = base_url
-            pk = data.get("public_key")
-            if pk:
-                pubkeys[node_id] = pk
-    except:
-        pass
+    # Retry health check up to 3 times per node
+    for attempt in range(3):
+        try:
+            r = requests.get(f"{base_url}/health", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                # Use the REAL node_id reported by the node, not a synthetic one
+                real_node_id = data.get("node_id", f"node_{i}")
+                online_nodes[real_node_id] = base_url
+                pk = data.get("public_key")
+                if pk:
+                    pubkeys[real_node_id] = pk
+                print(f"  ✅ Found {real_node_id} at port {port}")
+                break
+        except:
+            if attempt < 2:
+                time.sleep(1)
 
 TOTAL = len(online_nodes)
 print(f"  Found {TOTAL} online nodes")
@@ -71,6 +81,7 @@ for name, members in shards.items():
 # ── Step 3: Gossip Registration (Fanout=4) ───────────────────
 print(f"\n[STEP 3] Gossip Registration (Fanout={GOSSIP_FANOUT})...")
 total_connections = 0
+failed_connections = 0
 
 for node_id in online_nodes:
     potential_peers = [n for n in online_nodes if n != node_id]
@@ -78,20 +89,36 @@ for node_id in online_nodes:
 
     for peer_id in peers_to_add:
         if node_id not in pubkeys:
+            print(f"  ⚠️ Skipping {node_id} → {peer_id}: no public key for {node_id}")
             continue
         payload = {
             "node_id": node_id,
             "url": online_nodes[node_id],
             "public_key_hex": pubkeys[node_id],
         }
-        try:
-            requests.post(f"{online_nodes[peer_id]}/peers/register", json=payload, timeout=1)
-            total_connections += 1
-        except:
-            pass
+        # Retry registration up to 3 times
+        registered = False
+        for attempt in range(3):
+            try:
+                print(f"  Attempting registration: {node_id} -> {peer_id}")
+                resp = requests.post(f"{online_nodes[peer_id]}/peers/register", json=payload, timeout=3)
+                if resp.status_code == 200:
+                    print(f"  ✅ Registration success: {resp.text}")
+                    total_connections += 1
+                    registered = True
+                    break
+                else:
+                    print(f"  ⚠️ {node_id} -> {peer_id}: HTTP {resp.status_code}, Response: {resp.text}")
+            except Exception as exc:
+                print(f"  ❌ Error registering {node_id} -> {peer_id}: {exc}")
+                if attempt < 2:
+                    time.sleep(0.5)
+        if not registered:
+            failed_connections += 1
 
 full_mesh = TOTAL * (TOTAL - 1)
 print(f"  Total connections: {total_connections}")
+print(f"  Failed connections: {failed_connections}")
 print(f"  Full mesh would be: {full_mesh}")
 print(f"  Reduction: {100 - (total_connections / max(full_mesh, 1) * 100):.1f}%")
 

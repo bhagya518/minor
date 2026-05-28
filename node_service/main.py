@@ -40,6 +40,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
+
+def safe_float(x):
+    """Safely convert to float, returning 0.0 if None"""
+    try:
+        return float(x) if x is not None else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
 # Import signed report system (Phase 2)
 from monitoring_report import MonitoringReport, ReportVerifier
@@ -243,6 +251,35 @@ async def startup_event():
         max_retries = 5
         retry_delay = 3  # seconds
         
+        # Determine private key based on node_id to avoid nonce collisions
+        node_private_key = os.getenv('PRIVATE_KEY')
+        if not node_private_key:
+            node_suffix = node_config.node_id.split('_')[-1].lower() if '_' in node_config.node_id else node_config.node_id
+            if len(node_suffix) == 1 and 'a' <= node_suffix <= 'z':
+                key_idx = ord(node_suffix) - ord('a')
+            else:
+                import hashlib
+                key_idx = int(hashlib.sha256(node_config.node_id.encode()).hexdigest(), 16)
+            
+            try:
+                from eth_account import Account
+                Account.enable_unaudited_hdwallet_features()
+                mnemonic = "test test test test test test test test test test test junk"
+                acct = Account.from_mnemonic(mnemonic, account_path=f"m/44'/60'/0'/0/{key_idx % 20}")
+                node_private_key = acct.key.hex()
+                logger.info(f"Mapped {node_config.node_id} to dynamically derived Hardhat private key index {key_idx % 20}")
+            except Exception as e:
+                logger.warning(f"Failed to derive dynamic key from mnemonic, using fallback mapping: {e}")
+                # Fallback to the known correct ones for the first 5
+                hardhat_keys = [
+                    '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
+                    '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d',
+                    '0x5de4111afa1a4b94908f83103eb1f1706365c2e68ca8203584777aa33827d5d8',
+                    '0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6',
+                    '0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a',
+                ]
+                node_private_key = hardhat_keys[key_idx % len(hardhat_keys)]
+            
         for attempt in range(max_retries):
             try:
                 if CONTRACT_INFO:
@@ -250,7 +287,7 @@ async def startup_event():
                         'rpc_url': 'http://localhost:8545',
                         'contract_address': CONTRACT_INFO['address'],
                         'chain_id': 31337,
-                        'private_key': '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',  # Hardhat account 0
+                        'private_key': node_private_key,
                         'gas_limit': 300000,
                         'gas_price_gwei': 20
                     }
@@ -259,7 +296,7 @@ async def startup_event():
                     blockchain_config = {
                         'rpc_url': 'http://localhost:8545',
                         'chain_id': 31337,
-                        'private_key': '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
+                        'private_key': node_private_key,
                         'gas_limit': 300000,
                         'gas_price_gwei': 20
                     }
@@ -282,12 +319,11 @@ async def startup_event():
                     logger.info(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
         
-        # Blockchain is optional - node can start without it for graceful degradation
-        if not blockchain_available:
-            logger.warning("⚠️ BLOCKCHAIN NOT AVAILABLE - Node will start in DEGRADED mode")
-            logger.warning("Blockchain features (reputation on-chain, slashing) will be disabled")
-            logger.warning("Monitoring and consensus will continue to work locally")
-            blockchain_client = None  # Ensure it's None for checks elsewhere
+        # Blockchain is required for this robust version
+        if not blockchain_available or not blockchain_client or not getattr(blockchain_client, 'contract_address', None):
+            raise RuntimeError("Blockchain contract not deployed or missing deployment.json")
+            
+        print("Loaded contract address:", blockchain_client.contract_address)
         
         # Initialize Epoch Manager for Phase 3 consensus
         try:
@@ -297,16 +333,32 @@ async def startup_event():
             logger.error(f"Failed to initialize Epoch Manager: {e}")
             epoch_manager = None
             
-        # Register node on blockchain
+        # Register node on blockchain with strict sequence checks and retries
         if blockchain_client:
-            try:
-                result = blockchain_client.register_node(node_config.node_id)
-                if result['success']:
-                    logger.info(f"Node registered on blockchain: {node_config.node_id}")
-                else:
-                    logger.warning(f"Failed to register on blockchain: {result.get('error')}")
-            except Exception as e:
-                logger.error(f"Error registering node on blockchain: {e}")
+            max_reg_attempts = 5
+            registered = False
+            for attempt in range(max_reg_attempts):
+                try:
+                    if blockchain_client.is_node_registered(node_config.node_id):
+                        logger.info(f"Node {node_config.node_id} is already registered on blockchain.")
+                        registered = True
+                        break
+                    
+                    logger.info(f"Attempting node registration on blockchain (attempt {attempt+1}/{max_reg_attempts})...")
+                    result = blockchain_client.register_node(node_config.node_id)
+                    if result['success'] or result.get('error') == 'Node already registered':
+                        logger.info(f"Node registered successfully on blockchain: {node_config.node_id}")
+                        registered = True
+                        break
+                    else:
+                        logger.warning(f"Failed to register on blockchain: {result.get('error')}")
+                except Exception as e:
+                    logger.error(f"Error registering node on blockchain: {e}")
+                
+                await asyncio.sleep(2)
+            
+            if not registered:
+                raise RuntimeError(f"CRITICAL: Failed to register node {node_config.node_id} on blockchain. Cannot proceed.")
         
         # Start monitoring scheduler
         if node_config.websites:
@@ -557,7 +609,7 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
             ml_rep = ml_consensus.calculate_enhanced_reputation(features)
             
             # Debug log
-            logger.info(f"ML reputation for {node_id}: {ml_rep:.4f} (features: {features})")
+            logger.info(f"ML reputation for {node_id}: {safe_float(ml_rep):.4f} (features: {features})")
             
             # Apply EWMA smoothing
             smoothed_rep = ml_consensus.apply_ewma_smoothing(node_id, ml_rep)
@@ -574,7 +626,7 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
             if smoothed_rep < 0.4:
                 results["slashed"].append(node_id)
                 logger.warning(
-                    f"ML SLASHED {node_id}: reputation {smoothed_rep:.4f} < 0.4 | "
+                    f"ML SLASHED {node_id}: reputation {safe_float(smoothed_rep):.4f} < 0.4 | "
                     f"status={mitigation.status} | shard={mitigation.shard}"
                 )
             else:
@@ -588,7 +640,7 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
                     ml_consensus.reputation[node_id] = max(0.0, current - 0.15)
                     logger.warning(
                         f"SLASHED {node_id}: voted {node_vote} but majority={majority_verdict} "
-                        f"reputation {current:.2f} -> {ml_consensus.reputation[node_id]:.2f}"
+                        f"reputation {safe_float(current):.2f} -> {safe_float(ml_consensus.reputation.get(node_id)):.2f}"
                     )
                 results["slashed"].append(node_id)
                 results["node_reputations"][node_id] = ml_consensus.reputation.get(node_id, 0.5) if ml_consensus else 0.5
@@ -645,7 +697,7 @@ async def process_monitoring_results():
 
                 logger.info(f"Live ML processed: {result_dict.get('url', 'unknown')} -> "
                            f"{enhanced_result.get('ml_prediction', 'unknown')} "
-                           f"(score: {enhanced_result.get('ml_score', 0.0):.3f})")
+                           f"(score: {safe_float(enhanced_result.get('ml_score', 0.0)):.3f})")
             else:
                 # Fallback to basic processing
                 enhanced_results.append({
@@ -681,8 +733,8 @@ async def process_monitoring_results():
         # Calculate PoR score
         por_score = TrustCalculator.calculate_por_score(trust_score, ml_score)
         
-        logger.info(f"Trust: {trust_score or 0.0:.4f}, ML: {ml_score or 0.0:.4f}, PoR: {por_score or 0.0:.4f}")
-        logger.info(f"Reputation updated for {node_config.node_id}: {trust_score or 0.0:.4f}")
+        logger.info(f"Trust: {safe_float(trust_score):.4f}, ML: {safe_float(ml_score):.4f}, PoR: {safe_float(por_score):.4f}")
+        logger.info(f"Reputation updated for {node_config.node_id}: {safe_float(trust_score):.4f}")
         
         # REMOVED: Per-node blockchain writes
         # Blockchain writes now handled by epoch_manager leader only (batch per epoch)

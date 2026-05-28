@@ -9,6 +9,7 @@
     "event ReputationUpdated(string indexed,uint256,uint256,uint256)",
     "function batchSlashNodes(string[],uint256[],string,uint256)",
     "function batchUpdateReputation(string[],uint256[],uint256[])",
+    "function epochDecisionsSubmitted(uint256) view returns (bool)",
     "function getAllNodes() view returns (string[])",
     "function getAllNodesWithReputation() view returns (string[],uint256[])",
     "function getEpochDecision(uint256) view returns (bool,uint256)",

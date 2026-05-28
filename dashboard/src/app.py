@@ -4,7 +4,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
-import time
 from datetime import datetime
 import concurrent.futures
 
@@ -32,12 +31,9 @@ def discover_nodes(seed_node=SEED_NODE):
     while nodes_to_check:
         node_url = nodes_to_check.pop()
         if node_url in discovered_nodes: continue
-        # Discovery: check /peers endpoint with a very short timeout
         peers_data = _get(f"{node_url}/peers", timeout=1)
         if peers_data:
-            # Handle both formats: dictionary 'peers' or list 'peer_list'
             peers = peers_data.get("peers") or peers_data.get("peer_list")
-            
             if isinstance(peers, dict):
                 for peer_id, peer_info in peers.items():
                     addr = peer_info.get("node_address") or f"{peer_info.get('host')}:{peer_info.get('port')}"
@@ -48,12 +44,8 @@ def discover_nodes(seed_node=SEED_NODE):
                     addr = f"{peer_info.get('host')}:{peer_info.get('port')}"
                     peer_url = f"http://{addr}"
                     if peer_url not in discovered_nodes: nodes_to_check.append(peer_url)
-        
         discovered_nodes.add(node_url)
     return list(discovered_nodes)
-
-def get_all_nodes():
-    return discover_nodes()
 
 def fmt_ts(ts):
     if not ts: return "—"
@@ -62,17 +54,14 @@ def fmt_ts(ts):
             return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
         if isinstance(ts, str):
             try:
-                # Try parsing as float first if it's a string
                 return datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
             except ValueError:
-                # Fallback to ISO parsing
                 return datetime.fromisoformat(ts.replace('Z', '+00:00')).strftime("%H:%M:%S")
         return str(ts)
     except Exception:
         return str(ts)[:10] if ts else "—"
 
 def tier_style(action):
-    # Tiered labels with emojis
     tiers = {
         "ALLOW": "🟢 ALLOW",
         "WARN": "🟡 WARN",
@@ -108,15 +97,10 @@ def mon_results_to_rows(mon_data):
         "Timestamp": fmt_ts(r.get("timestamp", ""))
     } for r in results if isinstance(r, dict)]
 
-def main():
-    st.set_page_config(page_title="🔍 Web Monitor Dashboard", layout="wide")
-    st.title("🔍 Decentralized Website Monitoring")
-    st.caption("Clean Performance View: Uptime & Node Reputation")
-    
-    ALL_NODES = get_all_nodes()
-    
+@st.fragment(run_every=5)
+def live_dashboard(ALL_NODES):
     with st.spinner(f"Synchronizing with {len(ALL_NODES)} nodes..."):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ALL_NODES)) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(ALL_NODES))) as ex:
             all_snaps = list(ex.map(fetch_node_snapshot, ALL_NODES))
 
     all_health = [s["health"] for s in all_snaps if s["health"] and "error" not in s["health"]]
@@ -127,7 +111,7 @@ def main():
 
     if not all_health:
         st.error("❌ No nodes responding. Ensure your node cluster is running.")
-        st.stop()
+        return
 
     # Metrics
     m1, m2, m3 = st.columns(3)
@@ -145,7 +129,6 @@ def main():
         for mon_res, reports in zip(all_mon_res, all_reports):
             rows = mon_results_to_rows(mon_res)
             if not rows and reports:
-                # Fallback to reports
                 reps = reports.get("reports", [])
                 rows = [{
                     "URL": r.get("url"), "Status": "🟢 UP" if r.get("is_reachable") else "🔴 DOWN",
@@ -193,7 +176,6 @@ def main():
         if all_reps:
             rep_rows = []
             for nid, val in sorted(all_reps.items(), key=lambda x: x[1], reverse=True):
-                # Get the mitigation action (ALLOW/WARN/QUARANTINE/SLASHED)
                 action_data = all_shards.get(nid, {})
                 action = action_data.get("action", "ALLOW") if isinstance(action_data, dict) else "ALLOW"
                 
@@ -204,10 +186,8 @@ def main():
                     "Current Shard": action_data.get("shard", "PRIMARY") if isinstance(action_data, dict) else "PRIMARY"
                 })
             
-            # Display a professional styled table
             st.table(pd.DataFrame(rep_rows))
             
-            # Reputation Distribution Chart
             df_rep = pd.DataFrame(rep_rows)
             fig_rep = px.bar(df_rep, x="Node Identifier", y="Reputation Score",
                             color="Reputation Score", 
@@ -218,6 +198,13 @@ def main():
         else:
             st.info("Nodes are syncing reputation state...")
 
+def main():
+    st.set_page_config(page_title="🔍 Web Monitor Dashboard", layout="wide")
+    st.title("🔍 Decentralized Website Monitoring")
+    st.caption("Clean Performance View: Uptime & Node Reputation")
+    
+    ALL_NODES = discover_nodes()
+    
     with st.sidebar:
         st.header("⚙️ Controls")
         if st.button("▶ Trigger Fresh Scan", use_container_width=True):
@@ -226,29 +213,11 @@ def main():
             st.success("Monitoring triggered!")
         
         st.divider()
-        
-        # AUTO-REFRESH SECTION
-        st.subheader("🔄 Auto Refresh")
-        auto_refresh = st.checkbox("Enable Auto Refresh", value=True)
-        refresh_interval = st.selectbox(
-            "Interval (seconds)",
-            options=[5, 10, 20, 30, 60],
-            index=1  # Default to 10s
-        )
-        
-        if auto_refresh:
-            # Use a visual countdown that doesn't feel like a "hang"
-            # This is pure Streamlit and requires no extra modules
-            countdown_placeholder = st.empty()
-            for i in range(refresh_interval, 0, -1):
-                countdown_placeholder.caption(f"🔄 Auto-refreshing in {i} seconds...")
-                time.sleep(1)
-            st.rerun()
-
-        st.divider()
         st.caption(f"Network: {len(ALL_NODES)} Active Nodes")
-        if st.button("🔄 Manual Refresh", use_container_width=True):
-            st.rerun()
+        st.caption("Live-sync enabled via @st.fragment")
+
+    # The fragment will auto-rerun without blocking the sidebar
+    live_dashboard(ALL_NODES)
 
 if __name__ == "__main__":
     main()

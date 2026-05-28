@@ -316,7 +316,7 @@ class WebsiteMonitor:
             try:
                 start_time = time.time()
                 
-                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as response:
+                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                     content = await response.text()
                     response_time = (time.time() - start_time) * 1000
                     
@@ -335,13 +335,15 @@ class WebsiteMonitor:
                 logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
                 if attempt == self.max_retries - 1:
                     results['error'] = 'Request timeout'
-                await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
                 
             except Exception as e:
                 logger.warning(f"HTTP request error on attempt {attempt + 1} for {url}: {e}")
                 if attempt == self.max_retries - 1:
                     results['error'] = str(e)
-                await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
         
         return results
     

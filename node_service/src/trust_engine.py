@@ -488,7 +488,7 @@ class TrustCalculator:
         Returns:
             PoR score (0-1)
         """
-        return 0.4 * monitoring_trust + 0.6 * ml_score
+        return 0.4 * (monitoring_trust or 0.0) + 0.6 * (ml_score or 0.0)
     
     @staticmethod
     def get_trust_level(score: float) -> str:

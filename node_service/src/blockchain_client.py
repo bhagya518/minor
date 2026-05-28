@@ -11,6 +11,7 @@ from web3 import Web3
 from eth_account import Account
 import time
 from datetime import datetime
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -121,86 +122,154 @@ class BlockchainClient:
     def _load_contract(self):
         """Load smart contract ABI and address"""
         try:
-            # Load contract ABI from blockchain directory
-            abi_file = os.path.join(os.path.dirname(__file__), '..', '..', 'blockchain', 'ProofOfReputation.json')
-            if os.path.exists(abi_file):
-                with open(abi_file, 'r') as f:
+            # ── 1. Load ABI ─────────────────────────────────────────────
+            # Prefer compiled Hardhat artifact (has the fullest ABI)
+            artifacts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'blockchain', 'artifacts', 'contracts', 'ProofOfReputation.sol')
+            contract_artifact = os.path.join(artifacts_dir, 'ProofOfReputation.json')
+            simple_abi_file = os.path.join(os.path.dirname(__file__), '..', '..', 'blockchain', 'ProofOfReputation.json')
+            deployment_file = os.path.join(os.path.dirname(__file__), '..', '..', 'blockchain', 'deployment.json')
+
+            if os.path.exists(contract_artifact):
+                with open(contract_artifact, 'r') as f:
+                    artifact = json.load(f)
+                    self.contract_abi = artifact.get('abi')
+                    logger.info(f"Loaded ABI from Hardhat artifact ({len(self.contract_abi or [])} entries)")
+            elif os.path.exists(simple_abi_file):
+                with open(simple_abi_file, 'r') as f:
                     contract_data = json.load(f)
-                    self.contract_abi = contract_data['abi']
-                    if not self.config['contract_address']:
-                        self.contract_address = contract_data.get('address')
+                    self.contract_abi = contract_data.get('abi')
+                    logger.info(f"Loaded ABI from simple JSON ({len(self.contract_abi or [])} entries)")
             else:
-                # Fallback to compiled artifacts
-                artifacts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'blockchain', 'artifacts', 'contracts', 'ProofOfReputation.sol')
-                contract_artifact = os.path.join(artifacts_dir, 'ProofOfReputation.json')
-                
-                if os.path.exists(contract_artifact):
-                    with open(contract_artifact, 'r') as f:
-                        artifact = json.load(f)
-                        self.contract_abi = artifact['abi']
-                else:
-                    raise FileNotFoundError("Contract ABI not found")
-            
-            if not self.config['contract_address']:
-                raise ValueError("Contract address not configured")
-            
-            self.contract_address = self.config['contract_address']
-            
-            # Create contract instance
+                raise FileNotFoundError("Contract ABI not found in either compiled artifact or simple JSON path.")
+
+            # ── 2. Resolve contract address (priority order) ────────────
+            # Priority: config dict > deployment.json > simple JSON > artifact
+            address = self.config.get('contract_address')
+
+            if not address and os.path.exists(deployment_file):
+                with open(deployment_file, 'r') as f:
+                    deployment = json.load(f)
+                    address = deployment.get('address') or deployment.get('contractAddress')
+                    if address:
+                        logger.info(f"Got contract address from deployment.json: {address}")
+
+            if not address and os.path.exists(simple_abi_file):
+                with open(simple_abi_file, 'r') as f:
+                    contract_data = json.load(f)
+                    address = contract_data.get('address')
+                    if address:
+                        logger.info(f"Got contract address from ProofOfReputation.json: {address}")
+
+            # ── 3. Validate address ─────────────────────────────────────
+            if not address:
+                raise ValueError(
+                    "Contract address not found! Ensure you have:\n"
+                    "  1. Deployed the contract (npx hardhat run scripts/deploy.js --network localhost)\n"
+                    "  2. deployment.json or ProofOfReputation.json exists in blockchain/ with an 'address' field\n"
+                    "  3. Or set CONTRACT_ADDRESS environment variable"
+                )
+
+            # Checksum the address
+            self.contract_address = Web3.to_checksum_address(address)
+            self.config['contract_address'] = self.contract_address
+
+            # ── 4. Create contract instance ─────────────────────────────
             self.contract = self.w3.eth.contract(
                 address=self.contract_address,
                 abi=self.contract_abi
             )
-            
-            logger.info(f"Contract loaded at address: {self.contract_address}")
-            
+
+            logger.info(f"✅ Contract loaded at address: {self.contract_address}")
+
         except Exception as e:
             logger.error(f"Failed to load contract: {e}")
             raise
+
+    def _ensure_ready(self):
+        """Guard: abort early if blockchain or contract is not available"""
+        if not self.w3 or not self.w3.is_connected():
+            raise ConnectionError("Web3 provider not connected")
+        if not self.contract or not getattr(self.contract, 'address', None):
+            raise RuntimeError(
+                f"Contract not initialized (address={self.contract_address}). "
+                "Deploy the contract first and ensure the address is saved."
+            )
+
     
     def _send_transaction(self, function_call, value: int = 0) -> Dict:
-        """Send transaction to blockchain"""
-        try:
-            # Build transaction - use pending nonce to handle multiple transactions from same account
-            transaction = function_call.build_transaction({
-                'from': self.account.address,
-                'value': value,
-                'gas': self.config['gas_limit'],
-                'gasPrice': self.w3.to_wei(self.config['gas_price_gwei'], 'gwei'),
-                'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-                'chainId': self.config['chain_id']
-            })
+        """Send transaction to blockchain with local nonce safety and retries"""
+        self._ensure_ready()
+        
+        if not hasattr(self, '_nonce_lock'):
+            self._nonce_lock = threading.Lock()
+        if not hasattr(self, '_local_nonce'):
+            self._local_nonce = None
             
-            # Sign transaction
-            signed_txn = self.w3.eth.account.sign_transaction(transaction, self.config['private_key'])
+        with self._nonce_lock:
+            for attempt in range(3):
+                try:
+                    # Fetch fresh pending count if local nonce is not initialized or lower
+                    pending_nonce = self.w3.eth.get_transaction_count(self.account.address, 'pending')
+                    if self._local_nonce is None or self._local_nonce < pending_nonce:
+                        self._local_nonce = pending_nonce
+                        
+                    nonce = self._local_nonce
+                    
+                    transaction = function_call.build_transaction({
+                        'from': self.account.address,
+                        'value': value,
+                        'gas': self.config['gas_limit'],
+                        'gasPrice': self.w3.to_wei(self.config['gas_price_gwei'], 'gwei'),
+                        'nonce': nonce,
+                        'chainId': self.config['chain_id']
+                    })
+                    
+                    # Sign transaction
+                    signed_txn = self.w3.eth.account.sign_transaction(transaction, self.config['private_key'])
+                    
+                    # Send transaction
+                    tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+                    
+                    # Increment local nonce immediately for subsequent transactions
+                    self._local_nonce += 1
+                    
+                    # Wait for receipt
+                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+                    
+                    if receipt.status == 1:
+                        logger.info(f"Transaction successful: {tx_hash.hex()}")
+                        return {
+                            'success': True,
+                            'tx_hash': tx_hash.hex(),
+                            'block_number': receipt.blockNumber,
+                            'gas_used': receipt.gasUsed
+                        }
+                    else:
+                        logger.error(f"Transaction failed: {tx_hash.hex()}")
+                        return {
+                            'success': False,
+                            'tx_hash': tx_hash.hex(),
+                            'error': 'Transaction reverted'
+                        }
+                        
+                except Exception as e:
+                    err_msg = str(e)
+                    logger.warning(f"Transaction attempt {attempt + 1} failed: {err_msg}")
+                    # If nonce is too low or transaction is already known, reset local nonce and retry
+                    if any(x in err_msg.lower() for x in ["nonce too low", "already known", "underpriced"]):
+                        self._local_nonce = None
+                        time.sleep(1)
+                        continue
+                    else:
+                        self._local_nonce = None
+                        return {
+                            'success': False,
+                            'error': err_msg
+                        }
             
-            # Send transaction
-            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            
-            # Wait for receipt
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
-            
-            if receipt.status == 1:
-                logger.info(f"Transaction successful: {tx_hash.hex()}")
-                return {
-                    'success': True,
-                    'tx_hash': tx_hash.hex(),
-                    'block_number': receipt.blockNumber,
-                    'gas_used': receipt.gasUsed
-                }
-            else:
-                logger.error(f"Transaction failed: {tx_hash.hex()}")
-                return {
-                    'success': False,
-                    'tx_hash': tx_hash.hex(),
-                    'error': 'Transaction reverted'
-                }
-                
-        except Exception as e:
-            logger.error(f"Transaction error: {e}")
             return {
                 'success': False,
-                'error': str(e)
+                'error': "Failed to send transaction after multiple attempts due to nonce/network issues"
             }
     
     def register_node(self, node_id: str) -> Dict:
@@ -220,7 +289,7 @@ class BlockchainClient:
             if self.is_node_registered(node_id):
                 logger.warning(f"Node {node_id} already registered")
                 return {
-                    'success': False,
+                    'success': True,
                     'error': 'Node already registered'
                 }
             
@@ -708,6 +777,7 @@ class BlockchainClient:
     def is_node_registered(self, node_id: str) -> bool:
         """Check if node is registered on blockchain"""
         try:
+            self._ensure_ready()
             return self.contract.functions.isNodeRegistered(node_id).call()
         except Exception as e:
             logger.error(f"Failed to check registration for node {node_id}: {e}")

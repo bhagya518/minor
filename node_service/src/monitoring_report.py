@@ -63,7 +63,7 @@ class MonitoringReport:
         payload = {
             "url": self.url,
             "epoch_id": self.epoch_id,
-            "response_ms": float(f"{self.response_ms:.2f}"),  # Precise 2 decimal places
+            "response_ms": float(f"{(self.response_ms or -1.0):.2f}"),  # Precise 2 decimal places
             "status_code": self.status_code,
             "ssl_valid": self.ssl_valid,
             "content_hash": self.content_hash,

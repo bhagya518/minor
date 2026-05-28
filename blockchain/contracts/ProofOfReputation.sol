@@ -354,6 +354,9 @@ contract ProofOfReputation {
     SlashRecord[] public slashHistory;
     mapping(string => SlashRecord[]) public nodeSlashHistory;
     
+    // Prevent double-spending / duplicate epoch submission
+    mapping(uint256 => bool) public epochDecisionsSubmitted;
+    
     // Events
     event AggregatedReportSubmitted(string indexed url, uint256 indexed epochId, bool consensusResult, uint256 totalWeight);
     event NodeSlashed(string indexed nodeId, uint256 amount, string reason, uint256 indexed epochId);
@@ -541,6 +544,10 @@ contract ProofOfReputation {
     ) external onlyAggregator {
         require(nodeIds.length == verdicts.length && nodeIds.length == reputations.length, "Array length mismatch");
         require(epochId > 0, "Epoch ID must be > 0");
+        require(!epochDecisionsSubmitted[epochId], "Epoch decision already submitted (double-spending prevention)");
+        
+        // Mark epoch as submitted
+        epochDecisionsSubmitted[epochId] = true;
         
         // Store epoch decision
         for (uint256 i = 0; i < nodeIds.length; i++) {

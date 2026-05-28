@@ -225,10 +225,14 @@ class EnhancedMLConsensusEngine:
             if isinstance(iso_artifact, dict):
                 self.behavioral_cols = list(iso_artifact.get('behavioral_cols', iso_artifact.get('feature_cols', [])))
                 self.iso_scaler = iso_artifact.get('scaler')
+                self.iso_min = iso_artifact.get('iso_min', -0.5)
+                self.iso_max = iso_artifact.get('iso_max', 0.5)
             else:
                 # If iso_artifact is the model itself, use RF features as fallback
                 self.behavioral_cols = self.rf_feature_cols
                 self.iso_scaler = None
+                self.iso_min = -0.5
+                self.iso_max = 0.5
             
             # Load Gradient Boosting meta-learner if available
             meta_path = os.path.join(model_path, 'meta_learner.joblib')
@@ -337,7 +341,7 @@ class EnhancedMLConsensusEngine:
                 
             # Batch ISO Prediction
             iso_scores = -self.iso_model.decision_function(iso_scaled)
-            iso_norms = np.clip(iso_scores / 10.0, 0.0, 1.0)
+            iso_norms = np.clip((iso_scores - self.iso_min) / (self.iso_max - self.iso_min + 1e-12), 0.0, 1.0)
             
             # 3. Fusion (Vectorized)
             if self.meta_model is not None:
@@ -420,8 +424,8 @@ class EnhancedMLConsensusEngine:
             iso_score = float(-self.iso_model.decision_function(beh_scaled)[0])
             logger.debug(f"ISO score: {iso_score}")
             
-            # Normalize ISO score (approximate normalization)
-            iso_norm = float(np.clip(iso_score / 10.0, 0.0, 1.0))
+            # Normalize ISO score using trained bounds
+            iso_norm = float(np.clip((iso_score - self.iso_min) / (self.iso_max - self.iso_min + 1e-12), 0.0, 1.0))
             logger.debug(f"ISO normalized: {iso_norm}")
             
             # Fusion approach: Use meta-learner if available, otherwise 70/30 weighted fusion
@@ -596,7 +600,8 @@ class EnhancedMLConsensusEngine:
         features_to_predict = []
         for sender_id in all_node_ids:
             sender_reports = reports_by_sender[sender_id]
-            features = self._extract_features_from_reports(sender_id, sender_reports, all_reports_context=reports)
+            # Extract per‑node features (no extra context argument)
+            features = self.extract_features_from_reports(sender_reports)
             features['collusion_score'] = 0.0
             features_to_predict.append(features)
         
