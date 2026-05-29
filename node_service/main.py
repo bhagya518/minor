@@ -1258,6 +1258,21 @@ async def get_registered_peers():
         "count": len(peer_registry)
     }
 
+@app.post("/config/urls")
+async def set_config_urls(payload: dict):
+    """
+    Update the list of URLs this node monitors.
+    Expected JSON payload: {"urls": ["https://example.com", ...]}
+    """
+    urls = payload.get("urls")
+    if not isinstance(urls, list):
+        raise HTTPException(status_code=400, detail="Invalid payload: 'urls' must be a list")
+    if node_config is None:
+        raise HTTPException(status_code=500, detail="Node not initialized")
+    node_config.websites = urls
+    logger.info(f"Node URLs updated to: {urls}")
+    return {"status": "ok", "urls": urls}
+
 @app.get("/reputation")
 async def get_reputation():
     """Get current reputation scores for all nodes"""

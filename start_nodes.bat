@@ -1,41 +1,115 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM Start 20 nodes in the background for high-density testing
-REM Ports used: 8005 - 8024
+REM ============================================================
+REM START COMPLETE PoR NETWORK
+REM Starts:
+REM  - 4 monitoring nodes
+REM  - setup_network.py
+REM ============================================================
 
-echo Starting 20 nodes...
-
-set NODES=a b c d e f g h i j k l m n o p q r s t
-set PORT=8005
-
-for %%n in (%NODES%) do (
-    echo Starting node_%%n on port !PORT!...
-    
-    if "%%n"=="d" (
-        start "node_%%n" cmd /k "cd node_service && set NODE_MODE=malicious && python main.py --port !PORT! --node-id node_%%n"
-    ) else if "%%n"=="m" (
-        start "node_%%n" cmd /k "cd node_service && set NODE_MODE=malicious && python main.py --port !PORT! --node-id node_%%n"
-    ) else (
-        start "node_%%n" cmd /k "cd node_service && set NODE_MODE=honest && python main.py --port !PORT! --node-id node_%%n"
-    )
-    
-    set /a PORT+=1
-    timeout /t 1 /nobreak >nul
-)
+title Proof of Reputation Network Launcher
 
 echo.
-echo All 20 nodes started! Wait 15 seconds for initialization...
-timeout /t 15 /nobreak >nul
+echo ============================================
+echo   STARTING PROOF OF REPUTATION NETWORK
+echo ============================================
+echo.
 
-echo Running setup_network.py to register peers...
+REM ------------------------------------------------------------
+REM Create logs directory
+REM ------------------------------------------------------------
+
+if not exist logs mkdir logs
+
+REM ------------------------------------------------------------
+REM Start Node A
+REM ------------------------------------------------------------
+
+echo Starting node_a on port 8005...
+
+start "node_a" cmd /k ^
+"cd /d %~dp0node_service && ^
+set NODE_MODE=honest && ^
+python main.py --port 8005 --node-id node_a ^
+> ..\logs\node_a.log 2>&1"
+
+timeout /t 2 /nobreak >nul
+
+REM ------------------------------------------------------------
+REM Start Node B
+REM ------------------------------------------------------------
+
+echo Starting node_b on port 8006...
+
+start "node_b" cmd /k ^
+"cd /d %~dp0node_service && ^
+set NODE_MODE=honest && ^
+python main.py --port 8006 --node-id node_b ^
+> ..\logs\node_b.log 2>&1"
+
+timeout /t 2 /nobreak >nul
+
+REM ------------------------------------------------------------
+REM Start Node C
+REM ------------------------------------------------------------
+
+echo Starting node_c on port 8007...
+
+start "node_c" cmd /k ^
+"cd /d %~dp0node_service && ^
+set NODE_MODE=honest && ^
+python main.py --port 8007 --node-id node_c ^
+> ..\logs\node_c.log 2>&1"
+
+timeout /t 2 /nobreak >nul
+
+REM ------------------------------------------------------------
+REM Start Node D (Malicious)
+REM ------------------------------------------------------------
+
+echo Starting node_d on port 8008...
+
+start "node_d" cmd /k ^
+"cd /d %~dp0node_service && ^
+set NODE_MODE=malicious && ^
+python main.py --port 8008 --node-id node_d ^
+> ..\logs\node_d.log 2>&1"
+
+timeout /t 2 /nobreak >nul
+
+echo.
+echo ============================================
+echo All 4 nodes started successfully!
+echo ============================================
+echo.
+
+REM ------------------------------------------------------------
+REM Wait for initialization
+REM ------------------------------------------------------------
+
+echo Waiting 30 seconds for node initialization...
+timeout /t 30 /nobreak
+
+REM ------------------------------------------------------------
+REM Run setup_network.py
+REM ------------------------------------------------------------
+
+echo.
+echo Running setup_network.py...
+echo.
+
 python setup_network.py
 
 echo.
-echo Nodes are now running and registered.
-echo Realistic Performance for 20 Nodes:
-echo Latency: ~1,930ms
-echo Throughput: ~40.0 RPS
+echo ============================================
+echo NETWORK SETUP COMPLETE
+echo ============================================
 echo.
-echo Press any key to stop all nodes (close the terminal windows)...
+
+echo Dashboard command:
+echo cd dashboard\src
+echo streamlit run app.py
+
+echo.
 pause

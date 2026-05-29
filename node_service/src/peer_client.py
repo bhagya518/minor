@@ -344,8 +344,9 @@ class PeerClient:
             if was_compressed:
                 logger.debug(f"Compressed message data for {target_node_id}")
             
-            # Send message with retry
-            url = f"http://{peer.host}:{peer.port}/peer/message"
+            # Send message with retry to the actual P2P port (port + 1000)
+            peer_p2p_port = peer.port + 1000
+            url = f"http://{peer.host}:{peer_p2p_port}/peer/message"
             
             for attempt in range(PeerConfig.MAX_RETRIES):
                 try:
