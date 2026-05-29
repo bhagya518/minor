@@ -1,8 +1,0 @@
-Metric,Value,Unit
-Nodes Online,200,count
-Health Avg Latency,15.53,ms
-Health P99 Latency,43.59,ms
-Consensus Avg Latency,7.62,ms
-Consensus P99 Latency,9.38,ms
-Reputation Avg Latency,9.54,ms
-Throughput,200.0,RPS
