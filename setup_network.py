@@ -1,7 +1,7 @@
 """
-setup_network.py (200-Node Sharded Version)
-1. Detects all online nodes dynamically (supports 20 or 200)
-2. Creates shards of 10 nodes each
+setup_network.py (8-Node Sharded Version)
+1. Detects online nodes dynamically
+2. Creates shards of up to 10 nodes each
 3. Assigns each shard 5 unique URLs to monitor
 4. Implements Gossip-style registration (Fanout=4 per node)
 """
@@ -12,14 +12,11 @@ import random
 import json
 
 # ── Configuration ────────────────────────────────────────────
-MAX_NODES = 200
+MAX_NODES = 8
 BASE_PORT = 8005
 GOSSIP_FANOUT = 4
 NODES_PER_SHARD = 10
 URLS_PER_SHARD = 5
-
-# Generate URL pool (unique monitoring targets)
-URL_POOL = [f"https://httpbin.org/status/{200 + i}" for i in range(100)]
 
 print("\n=== INITIALIZING SHARDED NETWORK ===")
 
@@ -28,20 +25,19 @@ print("\n[STEP 1] Discovering online nodes...")
 online_nodes = {}
 pubkeys = {}
 
-# Wait a few seconds for nodes to fully start their FastAPI servers
 print("  Waiting for nodes to initialize...")
-time.sleep(5)
+# Give nodes time to start their FastAPI servers
+time.sleep(15)
 
 for i in range(MAX_NODES):
     port = BASE_PORT + i
-    base_url = f"http://localhost:{port}"
+    base_url = f"http://127.0.0.1:{port}"
     # Retry health check up to 3 times per node
     for attempt in range(3):
         try:
             r = requests.get(f"{base_url}/health", timeout=3)
             if r.status_code == 200:
                 data = r.json()
-                # Use the REAL node_id reported by the node, not a synthetic one
                 real_node_id = data.get("node_id", f"node_{i}")
                 online_nodes[real_node_id] = base_url
                 pk = data.get("public_key")
@@ -49,7 +45,7 @@ for i in range(MAX_NODES):
                     pubkeys[real_node_id] = pk
                 print(f"  ✅ Found {real_node_id} at port {port}")
                 break
-        except:
+        except Exception:
             if attempt < 2:
                 time.sleep(1)
 
@@ -63,7 +59,7 @@ if TOTAL < 2:
 # ── Step 2: Create dynamic shards ────────────────────────────
 print(f"\n[STEP 2] Creating shards ({NODES_PER_SHARD} nodes per shard)...")
 node_list = list(online_nodes.keys())
-random.shuffle(node_list)  # Randomize shard assignment
+random.shuffle(node_list)
 
 shards = {}
 shard_id = 0
@@ -86,7 +82,6 @@ failed_connections = 0
 for node_id in online_nodes:
     potential_peers = [n for n in online_nodes if n != node_id]
     peers_to_add = random.sample(potential_peers, min(GOSSIP_FANOUT, len(potential_peers)))
-
     for peer_id in peers_to_add:
         if node_id not in pubkeys:
             print(f"  ⚠️ Skipping {node_id} → {peer_id}: no public key for {node_id}")
@@ -96,7 +91,6 @@ for node_id in online_nodes:
             "url": online_nodes[node_id],
             "public_key_hex": pubkeys[node_id],
         }
-        # Retry registration up to 3 times
         registered = False
         for attempt in range(3):
             try:
@@ -125,19 +119,20 @@ print(f"  Reduction: {100 - (total_connections / max(full_mesh, 1) * 100):.1f}%"
 # ── Step 4: Sharded URL Assignment ───────────────────────────
 print(f"\n[STEP 4] Sharded URL Assignment ({URLS_PER_SHARD} URLs per shard)...")
 
+# Generate URL pool (unique monitoring targets)
+URL_POOL = [f"https://httpbin.org/status/{200 + i}" for i in range(100)]
+
 for shard_idx, (shard_name, members) in enumerate(shards.items()):
     start_idx = (shard_idx * URLS_PER_SHARD) % len(URL_POOL)
     shard_urls = URL_POOL[start_idx:start_idx + URLS_PER_SHARD]
-
     for node_id in members:
         if node_id not in online_nodes:
             continue
         payload = {"urls": shard_urls}
         try:
             requests.post(f"{online_nodes[node_id]}/config/urls", json=payload, timeout=1)
-        except:
-            pass  # Endpoint may not exist yet on some nodes
-
+        except Exception:
+            pass
     print(f"  {shard_name}: assigned {len(shard_urls)} URLs to {len(members)} nodes")
 
 # ── Step 5: Save network topology ────────────────────────────

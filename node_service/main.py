@@ -15,7 +15,7 @@ import argparse
 import numpy as np
 
 # Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -251,8 +251,25 @@ async def startup_event():
         max_retries = 5
         retry_delay = 3  # seconds
         
-        # Determine private key based on node_id to avoid nonce collisions
         node_private_key = os.getenv('PRIVATE_KEY')
+        if node_private_key:
+            node_private_key = node_private_key.strip().strip('"').strip("'")
+            
+        # Validate if private key is a valid 64-char hex string
+        is_valid_hex = False
+        if node_private_key:
+            clean_key = node_private_key[2:] if node_private_key.startswith('0x') else node_private_key
+            if len(clean_key) == 64:
+                try:
+                    int(clean_key, 16)
+                    is_valid_hex = True
+                except ValueError:
+                    pass
+                    
+        if not is_valid_hex:
+            logger.warning(f"PRIVATE_KEY from environment ('{node_private_key}') is missing or invalid. Falling back to dynamic key derivation.")
+            node_private_key = None
+            
         if not node_private_key:
             node_suffix = node_config.node_id.split('_')[-1].lower() if '_' in node_config.node_id else node_config.node_id
             if len(node_suffix) == 1 and 'a' <= node_suffix <= 'z':
@@ -284,7 +301,7 @@ async def startup_event():
             try:
                 if CONTRACT_INFO:
                     blockchain_config = {
-                        'rpc_url': 'http://localhost:8545',
+                        'rpc_url': 'http://127.0.0.1:8545',
                         'contract_address': CONTRACT_INFO['address'],
                         'chain_id': 31337,
                         'private_key': node_private_key,
@@ -294,7 +311,7 @@ async def startup_event():
                     blockchain_client = BlockchainClient(config=blockchain_config)
                 else:
                     blockchain_config = {
-                        'rpc_url': 'http://localhost:8545',
+                        'rpc_url': 'http://127.0.0.1:8545',
                         'chain_id': 31337,
                         'private_key': node_private_key,
                         'gas_limit': 300000,
@@ -406,7 +423,7 @@ async def startup_event():
                                 # Tell that peer about us
                                 await client.post(f"{peer_url}/peers/register", json={
                                     "node_id": node_config.node_id,
-                                    "url": f"http://localhost:{node_config.port}",
+                                    "url": f"http://127.0.0.1:{node_config.port}",
                                     "public_key_hex": NODE_SIGNER.public_key_hex
                                 }, timeout=5.0)
                 except Exception as e:

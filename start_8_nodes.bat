@@ -16,6 +16,7 @@ rem Start 8 nodes for testing
 rem Ports used: 8005 - 8012
 
 echo Starting 8 nodes...
+if not exist logs mkdir logs
 
 set NODES=a b c d e f g h
 set PORT=8005
@@ -31,9 +32,9 @@ for %%n in (%NODES%) do (
     if "%%n"=="g" set "PRIVATE_KEY=%ACCOUNT_G%"
     if "%%n"=="h" set "PRIVATE_KEY=%ACCOUNT_H%"
     if "%%n"=="d" (
-        start "node_%%n" cmd /k "cd node_service && set NODE_MODE=malicious && set PRIVATE_KEY=!PRIVATE_KEY! && python main.py --port !PORT! --node-id node_%%n"
+        start "node_%%n" cmd /c "cd node_service && set NODE_MODE=malicious && set PRIVATE_KEY=!PRIVATE_KEY! && python main.py --port !PORT! --node-id node_%%n > logs\node_%%n.log 2>&1"
     ) else (
-        start "node_%%n" cmd /k "cd node_service && set NODE_MODE=honest && set PRIVATE_KEY=!PRIVATE_KEY! && python main.py --port !PORT! --node-id node_%%n"
+        start "node_%%n" cmd /c "cd node_service && set NODE_MODE=honest && set PRIVATE_KEY=!PRIVATE_KEY! && python main.py --port !PORT! --node-id node_%%n > logs\node_%%n.log 2>&1"
     )
     set /a PORT+=1
     timeout /t 1 /nobreak >nul
@@ -41,7 +42,7 @@ for %%n in (%NODES%) do (
 
 echo.
 echo All 8 nodes started! Wait 10 seconds for initialization...
-timeout /t 10 /nobreak >nul
+timeout /t 30 /nobreak >nul
 
 echo Running setup_network.py to register peers...
 python setup_network.py

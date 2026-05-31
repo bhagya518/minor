@@ -1,21 +1,20 @@
 {
-  "total_nodes": 8,
+  "total_nodes": 7,
   "num_shards": 1,
   "gossip_fanout": 4,
-  "total_connections": 0,
-  "full_mesh_connections": 56,
+  "total_connections": 28,
+  "full_mesh_connections": 42,
   "shards": {
     "SHARD_0": [
       "node_d",
-      "node_g",
-      "node_b",
       "node_a",
-      "node_f",
-      "node_c",
       "node_e",
-      "node_h"
+      "node_b",
+      "node_h",
+      "node_g",
+      "node_f"
     ]
   },
   "urls_per_shard": 5,
-  "timestamp": 1779983442.1157887
+  "timestamp": 1780121728.1402874
 }

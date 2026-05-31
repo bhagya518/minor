@@ -28,6 +28,18 @@ class BlockchainClient:
             config: Configuration dictionary with blockchain settings
         """
         self.config = config or self._load_config()
+        
+        # Robust Hex Normalization for passed config dictionary
+        if self.config.get('private_key'):
+            self.config['private_key'] = str(self.config['private_key']).strip().strip('"').strip("'")
+            if self.config['private_key'] and not self.config['private_key'].startswith('0x'):
+                self.config['private_key'] = '0x' + self.config['private_key']
+                
+        if self.config.get('contract_address'):
+            self.config['contract_address'] = str(self.config['contract_address']).strip().strip('"').strip("'")
+            if self.config['contract_address'] and not self.config['contract_address'].startswith('0x'):
+                self.config['contract_address'] = '0x' + self.config['contract_address']
+
         self.w3 = None
         self.contract = None
         self.account = None
@@ -41,12 +53,19 @@ class BlockchainClient:
         """Load blockchain configuration from environment or config file"""
         config = {
             'rpc_url': os.getenv('ETHEREUM_RPC_URL', 'http://127.0.0.1:8545'),
-            'private_key': os.getenv('PRIVATE_KEY'),
-            'contract_address': os.getenv('CONTRACT_ADDRESS'),
+            # Strip whitespace and ensure hex prefix for private key
+            'private_key': (os.getenv('PRIVATE_KEY') or '').strip(),
+            # Strip whitespace
+            'contract_address': (os.getenv('CONTRACT_ADDRESS') or '').strip(),
             'chain_id': int(os.getenv('CHAIN_ID', '31337')),
             'gas_limit': int(os.getenv('GAS_LIMIT', '200000')),
             'gas_price_gwei': int(os.getenv('GAS_PRICE_GWEI', '20'))
         }
+        # Normalize hex strings (add 0x prefix if missing)
+        if config['private_key'] and not config['private_key'].startswith('0x'):
+            config['private_key'] = '0x' + config['private_key']
+        if config['contract_address'] and not config['contract_address'].startswith('0x'):
+            config['contract_address'] = '0x' + config['contract_address']      
         
         # Try to load from deployment file if contract address not in env
         if not config['contract_address']:
@@ -63,7 +82,7 @@ class BlockchainClient:
         try:
             logger.info(f"Connecting to Ethereum network: {self.config['rpc_url']}")
             
-            self.w3 = Web3(Web3.HTTPProvider(self.config['rpc_url']))
+            self.w3 = Web3(Web3.HTTPProvider(self.config['rpc_url'], request_kwargs={'timeout': 2.0}))
             
             # Check connection
             if not self.w3.is_connected():
@@ -73,19 +92,40 @@ class BlockchainClient:
             
             # Set up account if private key provided
             if self.config['private_key']:
-                self.account = Account.from_key(self.config['private_key'])
-                logger.info(f"Using account: {self.account.address}")
-            else:
-                # Use first account from node
+                # Validate if it's a valid 64-character hex string before trying to parse
+                is_valid = False
+                clean_key = self.config['private_key'][2:] if self.config['private_key'].startswith('0x') else self.config['private_key']
+                if len(clean_key) == 64:
+                    try:
+                        int(clean_key, 16)
+                        is_valid = True
+                    except ValueError:
+                        pass
+                
+                if is_valid:
+                    try:
+                        self.account = Account.from_key(self.config['private_key'])
+                        logger.info(f"Using account from PRIVATE_KEY: {self.account.address}")
+                    except Exception as e:
+                        logger.error(f"Invalid PRIVATE_KEY format: {e}. Falling back to default account.")
+                        self.account = None
+                else:
+                    logger.error(f"Invalid PRIVATE_KEY format: '{self.config['private_key']}' is not a valid 64-character hex string. Falling back to default account.")
+                    self.config['private_key'] = None
+                    self.account = None
+            if not self.account:
+                # Use the first unlocked account from the node if available
                 accounts = self.w3.eth.accounts
                 if accounts:
-                    self.account = Account.from_key(os.getenv('PRIVATE_KEY', '0x' + '0' * 64))
-                    logger.warning("Using default account (set PRIVATE_KEY for proper signing)")
+                    # Attempt to use the account without a private key (read‑only calls)
+                    self.account = Account.from_key('0x' + '0' * 64)
+                    logger.warning("Using placeholder account for read‑only operations. Set a valid PRIVATE_KEY for transaction signing.")
             
             logger.info("Connected to Ethereum network successfully")
             
         except Exception as e:
             logger.error(f"Failed to connect to blockchain: {e}")
+            # Re‑raise to allow caller to handle retry logic
             raise
     
     def is_blockchain_available(self) -> bool:
@@ -146,12 +186,23 @@ class BlockchainClient:
             # Priority: config dict > deployment.json > simple JSON > artifact
             address = self.config.get('contract_address')
 
+            # Try to load from deployment file if contract address not in env
             if not address and os.path.exists(deployment_file):
                 with open(deployment_file, 'r') as f:
                     deployment = json.load(f)
-                    address = deployment.get('address') or deployment.get('contractAddress')
+                    address = deployment.get('contractAddress') or deployment.get('address')
                     if address:
-                        logger.info(f"Got contract address from deployment.json: {address}")
+                        logger.info(f"Got contract address from deployment.json (src dir): {address}")
+            
+            # New fallback: look in the top-level blockchain folder
+            if not address:
+                alt_deployment = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'blockchain', 'deployment.json'))
+                if os.path.exists(alt_deployment):
+                    with open(alt_deployment, 'r') as f:
+                        deployment = json.load(f)
+                        address = deployment.get('contractAddress') or deployment.get('address')
+                        if address:
+                            logger.info(f"Got contract address from blockchain/deployment.json: {address}")
 
             if not address and os.path.exists(simple_abi_file):
                 with open(simple_abi_file, 'r') as f:
@@ -225,7 +276,7 @@ class BlockchainClient:
                     })
                     
                     # Sign transaction
-                    signed_txn = self.w3.eth.account.sign_transaction(transaction, self.config['private_key'])
+                    signed_txn = self.account.sign_transaction(transaction)
                     
                     # Send transaction
                     tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
@@ -234,7 +285,7 @@ class BlockchainClient:
                     self._local_nonce += 1
                     
                     # Wait for receipt
-                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=5)
                     
                     if receipt.status == 1:
                         logger.info(f"Transaction successful: {tx_hash.hex()}")

@@ -8,7 +8,7 @@ from datetime import datetime
 import concurrent.futures
 
 # Dynamic node discovery
-SEED_NODE = "http://localhost:8005"
+SEED_NODE = "http://127.0.0.1:8005"
 
 def _get(url, timeout=5):
     try:

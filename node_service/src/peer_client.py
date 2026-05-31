@@ -462,7 +462,7 @@ class PeerClient:
             except Exception: 
                 return 0
 
-        our_shard = get_shard_id(f"http://localhost:{self.port}")
+        our_shard = get_shard_id(f"http://127.0.0.1:{self.port}")
         
         shard_peers = [u for u in peer_urls if get_shard_id(u) == our_shard]
         external_peers = [u for u in peer_urls if get_shard_id(u) != our_shard]
