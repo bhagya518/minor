@@ -208,7 +208,7 @@ class PeerClient:
         
         # Verify signature
         try:
-            is_valid = ReportVerifier.verify(signature, canonical, sender_pubkey)
+            is_valid = ReportVerifier.verify_signature(signature, canonical, sender_pubkey)
             if not is_valid:
                 logger.warning(f"Invalid signature from sender {message.get('sender_id')}")
             return is_valid
@@ -442,6 +442,8 @@ class PeerClient:
         """
         Broadcast a signed MonitoringReport to a subset of peers using Sharded Gossip.
         Prioritizes peers in the same shard, with a bridge to other shards.
+        
+        Each broadcast task uses its own async context manager to avoid double-release crashes.
         """
         logger.info(f"broadcast_report called with {len(peer_urls)} peers")
         
@@ -484,50 +486,26 @@ class PeerClient:
         logger.info(f"Sharded Gossip: shard={our_shard} | local={len(shard_peers)} | ext={len(external_peers)}")
         logger.info(f"Selected Targets: {selected_urls}")
         
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=PeerConfig.REPORT_TIMEOUT),
-            connector=aiohttp.TCPConnector(limit=PeerConfig.CONNECTION_LIMIT, limit_per_host=PeerConfig.CONNECTION_PER_HOST)
-        ) as session:
-            tasks = []
-            
-            for peer_url in selected_urls:
-                try:
-                    # Add sender header to identify who sent this report
+        # Broadcast using per-task async context managers
+        for peer_url in selected_urls:
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=PeerConfig.REPORT_TIMEOUT),
+                    connector=aiohttp.TCPConnector(limit=1, limit_per_host=1)
+                ) as session:
                     headers = {
                         "X-Node-ID": self.node_id,
                         "Content-Type": "application/json"
                     }
-                    
-                    task = session.post(
+                    async with session.post(
                         f"{peer_url}/report",
                         json=payload,
                         headers=headers
-                    )
-                    tasks.append((peer_url, task))
-                except Exception as e:
-                    logger.warning(f"Failed to create broadcast task for {peer_url}: {e}")
-                    results[peer_url] = False
-            
-            # Execute all broadcasts concurrently
-            if tasks:
-                responses = await asyncio.gather(
-                    *[task for _, task in tasks],
-                    return_exceptions=True
-                )
-                
-                for i, (peer_url, _) in enumerate(tasks):
-                    response = responses[i]
-                    
-                    if isinstance(response, Exception):
-                        results[peer_url] = False
-                    else:
-                        try:
-                            if response.status == 200:
-                                results[peer_url] = True
-                            else:
-                                results[peer_url] = False
-                        finally:
-                            await response.release()
+                    ) as response:
+                        results[peer_url] = (response.status == 200)
+            except Exception as e:
+                logger.warning(f"Broadcast to {peer_url} failed: {e}")
+                results[peer_url] = False
         
         success_count = sum(results.values())
         logger.info(f"Report broadcast completed: {success_count}/{len(selected_urls)} peers received report for {report.url} (epoch {report.epoch_id})")
@@ -749,10 +727,10 @@ class PeerClient:
         
         logger.info(f"Received epoch decision for epoch {epoch_id} from leader {leader_id}")
         
-        # Store the decision locally for consistency
+        # Finalize and sync state locally
         if epoch_manager := get_epoch_manager():
-            epoch_manager.epoch_decisions[epoch_id] = decision
-            logger.info(f"Epoch {epoch_id}: Decision stored from leader {leader_id}")
+            epoch_manager.finalize_decision(epoch_id, decision)
+            logger.info(f"Epoch {epoch_id}: Decision finalized and synced from leader {leader_id}")
         
         # Forward to any registered handlers
         if 'epoch_decision' in self.message_handlers:
@@ -905,6 +883,49 @@ class PeerClient:
                 for p in self.peers.values()
             ]
         }
+
+    async def register_with_peer(self, peer_host: str, peer_port: int) -> bool:
+        """
+        Register with a peer using the spec flow: GET /health → POST /peers/register
+        
+        Args:
+            peer_host: Peer host address
+            peer_port: Peer API port
+            
+        Returns:
+            True if registration successful
+        """
+        p2p_port = peer_port + 1000  # P2P port = API port + 1000
+        
+        try:
+            # Step 1: GET /health to get node_id and public_key_hex
+            health_url = f"http://{peer_host}:{peer_port}/health"
+            async with self.session.get(health_url) as response:
+                if response.status != 200:
+                    logger.warning(f"Peer health check failed: {response.status}")
+                    return False
+                health_data = await response.json()
+                node_id = health_data['node_id']
+                public_key_hex = health_data['public_key_hex']
+            
+            # Step 2: POST /peers/register to complete registration
+            register_url = f"http://{peer_host}:{peer_port}/peers/register"
+            async with self.session.post(register_url, json={
+                'node_id': self.node_id,
+                'url': f"http://{self.host}:{self.port}",
+                'public_key_hex': self.public_key_hex
+            }) as response:
+                if response.status != 200:
+                    logger.warning(f"Peer registration failed: {response.status}")
+                    return False
+            
+            # Add peer locally with correct p2p_port
+            await self.add_peer(node_id, peer_host, p2p_port, public_key_hex)
+            logger.info(f"Successfully registered with peer {node_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to register with peer {peer_host}:{peer_port}: {e}")
+            return False
 
 if __name__ == "__main__":
     # Test the peer client

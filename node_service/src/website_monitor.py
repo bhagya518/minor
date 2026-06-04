@@ -25,7 +25,7 @@ NODE_MODE = os.environ.get('NODE_MODE', 'honest').lower()
 
 def get_current_epoch():
     """Get current epoch ID"""
-    return int(time.time() // 5)  # 5-second epochs
+    return int(time.time() // 60)  # 60-second epochs
 
 def get_latest_results():
     """Get latest monitoring results (module-level function)"""
@@ -92,7 +92,7 @@ def _build_signed_report(url: str, response_ms: float, status_code: int,
 class WebsiteMonitor:
     """Website monitoring service with comprehensive checks"""
     
-    def __init__(self, interval: int = 5, timeout: int = 2, max_retries: int = 3):
+    def __init__(self, interval: int = 60, timeout: int = 2, max_retries: int = 3):
         """
         Initialize website monitor
         
@@ -131,7 +131,7 @@ class WebsiteMonitor:
             url: Website URL to monitor
             
         Returns:
-            Dictionary with monitoring results
+            Dictionary with monitoring results (spec-compliant format)
         """
         start_time = time.time()
         
@@ -144,7 +144,7 @@ class WebsiteMonitor:
             if not parsed_url.scheme or not parsed_url.netloc:
                 raise ValueError("Invalid URL format")
             
-            # Initialize results
+            # Initialize results with SPEC-COMPLIANT keys
             results = {
                 'url': url,
                 'timestamp': datetime.now().isoformat(),
@@ -153,11 +153,12 @@ class WebsiteMonitor:
                 'response_time_ms': None,
                 'ssl_valid': None,
                 'dns_resolution_time_ms': None,
+                'content': None,  # ADDED: Full content
                 'content_hash': None,
-                'content_length': None,
+                'total_time_ms': None,  # ADDED: Total time including DNS + HTTP
                 'error': None,
                 'checks_performed': [],
-                'node_mode': NODE_MODE  # Track node mode for debugging
+                'node_mode': NODE_MODE
             }
             
             # DNS resolution check
@@ -167,28 +168,26 @@ class WebsiteMonitor:
             
             # HTTP request check
             http_results = await self._check_http_request(url)
-            results.update(http_results)
+            results['http_status'] = http_results.get('http_status')
+            results['response_time_ms'] = http_results.get('response_time_ms')
+            results['content'] = http_results.get('content')
+            results['error'] = http_results.get('error')
             results['checks_performed'].append('http')
             
             # SSL check (if HTTPS)
             if parsed_url.scheme == 'https':
-                # If HTTP request succeeded, SSL is at least functionally valid
-                http_success = results.get('status') == 'success'
+                http_success = results.get('http_status') and 200 <= results['http_status'] < 400
                 ssl_result = await self._check_ssl_certificate(parsed_url.netloc)
-                
-                # Combine results: if either the dedicated check or the HTTP check worked, it's valid
-                # This provides a fallback if open_connection fails but aiohttp works
                 results['ssl_valid'] = ssl_result or http_success
                 results['checks_performed'].append('ssl')
             
             # Content hash calculation
-            if http_results.get('content'):
-                content_hash = self._calculate_content_hash(http_results['content'])
+            if results.get('content'):
+                content_hash = self._calculate_content_hash(results['content'])
                 results['content_hash'] = content_hash
-                results['content_length'] = len(http_results['content'])
                 results['checks_performed'].append('content_hash')
             
-            # Calculate total response time
+            # Calculate total response time (DNS + HTTP)
             total_time = (time.time() - start_time) * 1000
             results['total_time_ms'] = total_time
             
@@ -198,65 +197,47 @@ class WebsiteMonitor:
             
             # MALICIOUS NODE BEHAVIOR: Generate false reports
             if is_malicious and results['status'] == 'success':
-                # Lie about the website status to generate false reports
-                # This simulates a malicious node trying to deceive the network
-                malicious_type = random.choice(['down', 'slow', 'ssl_invalid', 'agree_with_majority'])
+                # Force failure/anomaly for simulation speed
+                malicious_type = random.choice(['down', 'slow', 'ssl_invalid'])
                 
                 if malicious_type == 'down':
-                    # Report site as DOWN when it's actually UP
-                    results['is_reachable'] = False
                     results['http_status'] = 0
                     results['status'] = 'error'
                     results['error'] = 'Fake: reported as down'
                     logger.warning(f"[MALICIOUS NODE] Reporting {url} as DOWN (actually UP)")
                     
                 elif malicious_type == 'slow':
-                    # Report inflated response time
-                    fake_time = random.uniform(3000, 8000)  # 3-8 seconds
+                    fake_time = random.uniform(10000, 20000) # Extremely slow
                     results['response_time_ms'] = fake_time
                     results['status'] = 'success'
                     logger.warning(f"[MALICIOUS NODE] Reporting inflated response time for {url}: {fake_time:.0f}ms")
                     
                 elif malicious_type == 'ssl_invalid':
-                    # Report SSL as invalid when it's valid
                     results['ssl_valid'] = False
                     results['status'] = 'success'
                     logger.warning(f"[MALICIOUS NODE] Reporting SSL invalid for {url}")
-                    
-                elif malicious_type == 'agree_with_majority':
-                    # Sometimes agree with majority to avoid immediate detection
-                    logger.info(f"[MALICIOUS NODE] Agreeing with majority for {url} (avoiding detection)")
-                    # Keep results as-is (truthful)
-            else:
-                # Honest node: report truthfully
-                results['is_reachable'] = results['status'] == 'success'
             
             logger.info(f"Monitoring completed for {url}: {results['status']} (mode: {NODE_MODE})")
             
-            # Build and return signed MonitoringReport
-            signed_report = self._build_signed_report(
-                url=url,
-                response_ms=results.get('response_time_ms', -1),
-                status_code=results.get('http_status', 0),
-                ssl_valid=results.get('ssl_valid', False),
-                body=results.get('content', ''),
-                is_reachable=results.get('is_reachable', False)
-            )
-            
-            return signed_report
+            # Return dict (not MonitoringReport dataclass)
+            return results
             
         except Exception as e:
             logger.error(f"Error monitoring {url}: {e}")
-            # Return a minimal error report
-            error_report = self._build_signed_report(
-                url=url,
-                response_ms=-1,
-                status_code=0,
-                ssl_valid=False,
-                body='',
-                is_reachable=False
-            )
-            return error_report
+            # Return a minimal error dict
+            return {
+                'url': url,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'error',
+                'http_status': 0,
+                'response_time_ms': -1,
+                'ssl_valid': False,
+                'dns_resolution_time_ms': None,
+                'content': '',
+                'content_hash': '',
+                'total_time_ms': (time.time() - start_time) * 1000,
+                'error': str(e)
+            }
 
     def set_node_mode(self, mode: str):
         """
@@ -446,7 +427,7 @@ class WebsiteMonitor:
             urls: List of website URLs to monitor
             
         Returns:
-            List of monitoring results
+            List of monitoring results (dicts with spec-compliant keys)
         """
         logger.info(f"Starting monitoring of {len(urls)} websites")
         
@@ -477,39 +458,30 @@ class WebsiteMonitor:
                     'url': urls[i],
                     'timestamp': datetime.now().isoformat(),
                     'status': 'error',
+                    'http_status': 0,
+                    'response_time_ms': -1,
+                    'ssl_valid': False,
+                    'dns_resolution_time_ms': None,
+                    'content': '',
+                    'content_hash': '',
+                    'total_time_ms': 0,
                     'error': str(result)
                 })
             else:
+                # Already a dict with correct keys
                 processed_results.append(result)
-        
-        # Convert MonitoringReport objects to dicts for processing
-        final_results = []
-        for r in processed_results:
-            if hasattr(r, '__dataclass_fields__'):
-                # Preserve all fields from the signed report
-                final_results.append({
-                    'url': getattr(r, 'url', 'unknown'),
-                    'response_ms': getattr(r, 'response_ms', -1),
-                    'status_code': getattr(r, 'status_code', 0),
-                    'ssl_valid': getattr(r, 'ssl_valid', False),
-                    'is_reachable': getattr(r, 'is_reachable', False),
-                    'timestamp': getattr(r, 'timestamp', datetime.now().isoformat()),
-                    'status': 'success' if getattr(r, 'is_reachable', False) else 'error'
-                })
-            else:
-                final_results.append(r)
 
-        success_count = sum(1 for r in final_results if r.get('status') == 'success')
+        success_count = sum(1 for r in processed_results if r.get('status') == 'success')
         logger.info(f"Monitoring completed: {success_count}/{len(urls)} successful")
 
-        return final_results
+        return processed_results
     
     def extract_monitoring_features(self, results: List) -> Dict:
         """
         Extract features for ML model from monitoring results
 
         Args:
-            results: List of monitoring results (dicts or MonitoringReport objects)
+            results: List of monitoring results (dicts with spec-compliant keys)
 
         Returns:
             Dictionary with extracted features
@@ -523,28 +495,9 @@ class WebsiteMonitor:
                 'false_report_rate': 0
             }
 
-        # Convert MonitoringReport objects to dicts if needed
-        converted_results = []
-        for r in results:
-            if hasattr(r, '__dataclass_fields__'):
-                # It's a MonitoringReport dataclass, convert to dict
-                converted_results.append({
-                    'url': getattr(r, 'url', 'unknown'),
-                    'response_time_ms': getattr(r, 'response_ms', -1),
-                    'http_status': getattr(r, 'status_code', 0),
-                    'ssl_valid': getattr(r, 'ssl_valid', False),
-                    'content_hash': getattr(r, 'content_hash', ''),
-                    'is_reachable': getattr(r, 'is_reachable', False),
-                    'status': 'success' if getattr(r, 'is_reachable', False) else 'error'
-                })
-            else:
-                # It's already a dict
-                converted_results.append(r)
-
-        results = converted_results
-
+        # Results are already dicts with correct keys
         # Calculate average response time
-        response_times = [r.get('response_time_ms', 0) for r in results if r.get('response_time_ms')]
+        response_times = [r.get('response_time_ms', 0) for r in results if r.get('response_time_ms') and r.get('response_time_ms') > 0]
         avg_response_ms = sum(response_times) / len(response_times) if response_times else 0
 
         # Calculate SSL valid rate
@@ -552,19 +505,17 @@ class WebsiteMonitor:
         ssl_valid_count = sum(1 for r in ssl_checks if r.get('ssl_valid') is True)
         ssl_valid_rate = ssl_valid_count / len(ssl_checks) if ssl_checks else 1.0
 
-        # Calculate content match rate (simplified - in real system would compare with peers)
+        # Calculate content match rate
         content_hashes = [r.get('content_hash') for r in results if r.get('content_hash')]
         if len(content_hashes) > 1:
-            # Count unique hashes
             unique_hashes = set(content_hashes)
-            # Match rate is based on most common hash
             most_common_hash = max(set(content_hashes), key=content_hashes.count)
             match_count = content_hashes.count(most_common_hash)
             content_match_rate = match_count / len(content_hashes)
         else:
             content_match_rate = 1.0
         
-        # Calculate stale report rate (old timestamps)
+        # Calculate stale report rate
         current_time = datetime.now()
         stale_threshold = 300  # 5 minutes
         def _parse_ts(r):
@@ -580,7 +531,7 @@ class WebsiteMonitor:
         )
         stale_report_rate = stale_count / len(results) if results else 0
         
-        # Calculate false report rate (error status)
+        # Calculate false report rate
         false_count = sum(1 for r in results if r.get('status') == 'error')
         false_report_rate = false_count / len(results) if results else 0
         

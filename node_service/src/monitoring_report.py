@@ -59,6 +59,7 @@ class MonitoringReport:
         """
         Deterministic bytes used for hashing and signing.
         Order is fixed — never use asdict() directly (key order varies).
+        Includes timestamp for replay attack prevention.
         """
         payload = {
             "url": self.url,
@@ -68,8 +69,8 @@ class MonitoringReport:
             "ssl_valid": self.ssl_valid,
             "content_hash": self.content_hash,
             "is_reachable": self.is_reachable,
-            "timestamp": int(self.timestamp * 1000),  # Milliseconds for consistency
             "node_address": self.node_address,
+            "timestamp": int(self.timestamp * 1000),  # Milliseconds for consistency - CRITICAL for replay prevention
             "version": self.version
         }
         return json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -77,6 +78,17 @@ class MonitoringReport:
     def compute_hash(self) -> str:
         """Compute SHA-256 hash of canonical payload"""
         return hashlib.sha256(self.canonical_payload()).hexdigest()
+
+    def is_valid(self) -> bool:
+        """Validate report fields"""
+        return (
+            self.url != "" and
+            self.node_address != "" and
+            self.epoch_id >= 0 and
+            self.response_ms >= -1.0 and
+            self.status_code >= 0
+        )
+
 
 
 class NodeSigner:
@@ -140,11 +152,11 @@ class ReportVerifier:
     def verify(report: MonitoringReport, sender_public_key_hex: str) -> bool:
         """
         Returns True if signature is valid and hash matches payload.
-        
+
         Args:
             report: Signed monitoring report to verify
             sender_public_key_hex: Public key of the sender node
-            
+
         Returns:
             True if report is cryptographically valid
         """
@@ -153,31 +165,39 @@ class ReportVerifier:
             expected_hash = report.compute_hash()
             if expected_hash != report.report_hash:
                 return False
-            
+
             # Load sender's public key
             public_key_bytes = bytes.fromhex(sender_public_key_hex)
             public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
-            
+
             # Verify signature
             public_key.verify(
                 bytes.fromhex(report.signature),
                 bytes.fromhex(report.report_hash)
             )
             return True
-            
+
+        except Exception:
+            return False
+
+    @staticmethod
+    def verify_signature(signature_hex: str, message: str, public_key_hex: str) -> bool:
+        """
+        Generic signature verification for any string message.
+        """
+        try:
+            public_key_bytes = bytes.fromhex(public_key_hex)
+            public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+
+            public_key.verify(
+                bytes.fromhex(signature_hex),
+                message.encode()
+            )
+            return True
         except Exception:
             return False
     
-    def is_valid(self) -> bool:
-        """Validate report fields"""
-        return (
-            self.url != "" and
-            self.node_address != "" and
-            self.epoch_id >= 0 and
-            self.response_ms >= 0 and
-            self.status_code >= 0
-        )
-    
+
     @staticmethod
     def to_dict(report: MonitoringReport) -> dict:
         """Convert report to dictionary for serialization"""
@@ -215,12 +235,12 @@ class ReportVerifier:
         return report
 
 
-def current_epoch(window_seconds: int = 5) -> int:
+def current_epoch(window_seconds: int = 60) -> int:
     """
     All nodes produce the same epoch_id within the same time window.
     
     Args:
-        window_seconds: Duration of each epoch (default: 5 seconds)
+        window_seconds: Duration of each epoch (default: 60 seconds)
         
     Returns:
         Current epoch number (unix_time // window_seconds)

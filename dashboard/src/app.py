@@ -8,7 +8,7 @@ from datetime import datetime
 import concurrent.futures
 
 # Dynamic node discovery
-SEED_NODE = "http://127.0.0.1:8005"
+SEED_NODE = "http://127.0.0.1:8000"
 
 def _get(url, timeout=5):
     try:
@@ -91,8 +91,8 @@ def mon_results_to_rows(mon_data):
     return [{
         "URL": r.get("url", "—"),
         "Status": "🟢 UP" if (r.get("status") == "success" or r.get("is_reachable")) else "🔴 DOWN",
-        "HTTP": r.get("status_code", "—"),
-        "Response ms": round(r.get("response_ms") or 0, 1),
+        "HTTP": r.get("status_code") or r.get("http_status") or "—",
+        "Response ms": round(r.get("response_ms") or r.get("response_time_ms") or 0, 1),
         "SSL": "✅" if r.get("ssl_valid") else "❌",
         "Timestamp": fmt_ts(r.get("timestamp", ""))
     } for r in results if isinstance(r, dict)]
@@ -171,7 +171,7 @@ def live_dashboard(ALL_NODES):
             for nid, val in reps.items():
                 all_reps[nid] = val
                 shard_info = actions.get(nid, {})
-                all_shards[nid] = shard_info.get("shard", "PRIMARY") if isinstance(shard_info, dict) else "PRIMARY"
+                all_shards[nid] = shard_info
         
         if all_reps:
             rep_rows = []

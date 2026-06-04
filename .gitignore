@@ -3,6 +3,7 @@
 # ============================================================
 node_modules/
 **/node_modules/
+blockchain/node_modules_backup/
 
 # ============================================================
 # PYTHON
@@ -38,7 +39,9 @@ blockchain/coverage/
 *.csv
 *.xlsx
 *.parquet
+models/
 ml/models/
+ML_MINOR/models/
 ml/*.pkl
 ml/*.joblib
 ml/*.csv
@@ -82,6 +85,7 @@ node_service/__pycache__/
 node_service/src/__pycache__/
 node_service/epoch_data.db
 node_service/RUN_SYSTEM.md
+node_service/reputation_state_*.json
 
 # ============================================================
 # DASHBOARD CACHE
@@ -129,12 +133,15 @@ results/
 # CLEANUP
 # ============================================================
 clean_project/
+archive/
 # ============================================================
 # RESULTS & GRAPHS
 # ============================================================
 results/
 graphs/
-*.md
+output_results/
+ML_MINOR/results_output/
+
 *.png
 *.jpg
 *.jpeg

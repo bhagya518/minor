@@ -66,7 +66,7 @@ class EpochManager:
         self.slash_history = []  # history of slashing actions
         
         # Configuration
-        self.epoch_duration = 5  # seconds
+        self.epoch_duration = 60  # seconds
         self.epoch_verdicts = {}  # Initialize epoch verdicts dict
         self.min_peers_for_quorum = 1  # need reports from at least 1 other node (reduced for testing)
         self.quorum_threshold = 2/3  # 2/3 majority required
@@ -480,32 +480,108 @@ class EpochManager:
         logger.debug(f"Added report for epoch {epoch_id} (own={is_own}), total peer reports: {len(self.epoch_reports[epoch_id])}")
         return True
     
+    def finalize_decision(self, epoch_id: int, decision: Dict):
+        """
+        Finalize an epoch decision and sync local state.
+        Ensures all nodes (leader and followers) reflect the same reputation state.
+        """
+        self.epoch_decisions[epoch_id] = decision
+        
+        if self.ml_consensus_engine:
+            consensus_results = decision.get("consensus_results", {})
+            # Handle both 'reputations' and 'ewma_reputations' keys for compatibility
+            reputations = consensus_results.get("reputations") or consensus_results.get("ewma_reputations", {})
+            mitigation_actions = consensus_results.get("mitigation_actions", {})
+            
+            if reputations and mitigation_actions:
+                logger.info(f"Epoch {epoch_id}: Synchronizing local ML engine with finalized decision")
+                self.ml_consensus_engine.sync_state(reputations, mitigation_actions)
+            else:
+                # Fallback to node_reputations if consensus_results is structured differently
+                node_reputations = decision.get("node_reputations", {})
+                if node_reputations:
+                    # Synthesize mitigation actions if missing
+                    synth_mitigation = {}
+                    for nid, rep in node_reputations.items():
+                        m = self.ml_consensus_engine.apply_mitigation_policy(rep)
+                        synth_mitigation[nid] = {
+                            "status": m.status,
+                            "action": m.action,
+                            "shard": m.shard
+                        }
+                    self.ml_consensus_engine.sync_state(node_reputations, synth_mitigation)
+
     async def run_epoch_manager(self):
         """
-        Main epoch manager loop - runs every 60 seconds
-        Offset by 10 seconds from monitoring cycle to allow reports to arrive
+        Main epoch manager loop - runs on wall-clock schedule:
+        - Second 0: Assign tiers and shards
+        - Second 5: Wait for reports (report window ends)
+        - Second 55: Run ML analysis
+        - Second 58: Run consensus
+        - Second 59: Update reputations, re-assign tiers, trigger slashing
         """
-        logger.info("Starting epoch manager loop...")
-        
-        # Wait 10 seconds offset to allow reports to arrive
-        await asyncio.sleep(10)
+        logger.info("Starting epoch manager with wall-clock timing...")
         
         while True:
             try:
-                current_epoch = self.get_current_epoch()
+                now = time.time()
+                seconds_into_minute = now % 60
                 
-                # Process previous epoch (gives time for all reports to arrive)
-                previous_epoch = current_epoch - 1
+                # Second 0: Assign tiers and shards to all known nodes
+                if 0 <= seconds_into_minute < 1:
+                    await self._assign_tiers_and_shards()
                 
-                if previous_epoch in self.epoch_reports or previous_epoch in self.own_reports:
-                    await self.process_epoch(previous_epoch)
+                # Second 55: Run ML analysis on collected reports
+                elif 55 <= seconds_into_minute < 56:
+                    await self._run_ml_analysis()
                 
-                # Sleep for next epoch cycle
-                await asyncio.sleep(self.epoch_duration)
+                # Second 58: Run consensus on ML results
+                elif 58 <= seconds_into_minute < 59:
+                    await self._run_consensus()
+                
+                # Second 59: Update reputations, re-assign tiers, trigger slashing
+                elif 59 <= seconds_into_minute < 60:
+                    await self._update_reputations_and_slash()
+                
+                # Sleep briefly for responsiveness
+                await asyncio.sleep(0.5)
                 
             except Exception as e:
                 logger.error(f"Error in epoch manager loop: {e}")
-                await asyncio.sleep(10)  # Wait before retry
+                await asyncio.sleep(5)
+    
+    async def _assign_tiers_and_shards(self):
+        """Second 0: Assign tiers and shards based on current reputations"""
+        if self.ml_consensus_engine:
+            self.ml_consensus_engine._assign_nodes_to_shards()
+            logger.info("Tiers and shards assigned for new epoch")
+    
+    async def _run_ml_analysis(self):
+        """Second 55: Run ML analysis on collected reports"""
+        current_epoch = self.get_current_epoch()
+        previous_epoch = current_epoch - 1
+        
+        if previous_epoch in self.epoch_reports or previous_epoch in self.own_reports:
+            logger.info(f"Running ML analysis for epoch {previous_epoch}")
+            # ML will be run as part of process_epoch when called
+    
+    async def _run_consensus(self):
+        """Second 58: Run consensus (called from process_epoch)"""
+        current_epoch = self.get_current_epoch()
+        previous_epoch = current_epoch - 1
+        
+        if previous_epoch in self.epoch_reports or previous_epoch in self.own_reports:
+            await self.process_epoch(previous_epoch)
+    
+    async def _update_reputations_and_slash(self):
+        """Second 59: Update reputations, re-assign tiers, trigger slashing"""
+        if self.ml_consensus_engine:
+            # Re-assign tiers based on updated reputations
+            for node_id, action in self.ml_consensus_engine.mitigation_actions.items():
+                reputation = self.ml_consensus_engine.ewma_reputations.get(node_id, 0.90)
+                new_action = self.ml_consensus_engine.apply_mitigation_policy(reputation)
+                self.ml_consensus_engine.mitigation_actions[node_id] = new_action
+            logger.info("Tiers re-assigned based on updated reputations")
     
     async def process_epoch(self, epoch_id: int):
         """
@@ -812,7 +888,9 @@ class EpochManager:
             "blockchain_committed": False,
             "blockchain_tx": None
         }
-        self.epoch_decisions[epoch_id] = decision
+        
+        # Finalize and sync state locally
+        self.finalize_decision(epoch_id, decision)
         
         # Step 8: THEN submit to blockchain
         if self.is_leader and self.blockchain_client:

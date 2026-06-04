@@ -41,10 +41,10 @@ contract ProofOfReputation {
     }
 
     modifier onlyAggregator() {
-        require(msg.sender == owner, "Only aggregator can call this function");
+        require(msg.sender == owner || nodes[addressToNodeId[msg.sender]].isRegistered, "Only aggregator can call this function");
         _;
     }
-    
+
     modifier nodeRegistered(string memory nodeId) {
         require(nodes[nodeId].isRegistered, "Node must be registered");
         _;
@@ -55,19 +55,18 @@ contract ProofOfReputation {
         _;
     }
     
+    mapping(address => string) public addressToNodeId;
+
     constructor() {
         owner = msg.sender;
     }
-    
-    /**
-     * @dev Register a new node in the system
-     * @param nodeId Unique identifier for the node
-     */
+
     function registerNode(string memory nodeId) 
         external 
         validNodeId(nodeId) 
     {
         require(!nodes[nodeId].isRegistered, "Node already registered");
+        require(bytes(addressToNodeId[msg.sender]).length == 0, "Address already registered to a node");
         
         // Create new node with default values
         nodes[nodeId] = Node({
@@ -82,6 +81,7 @@ contract ProofOfReputation {
         });
         
         registeredNodes.push(nodeId);
+        addressToNodeId[msg.sender] = nodeId;
         
         emit NodeRegistered(nodeId, msg.sender);
     }

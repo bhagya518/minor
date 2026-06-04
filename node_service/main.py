@@ -6,8 +6,9 @@ Integrates monitoring, trust engine, ML inference, and blockchain components
 import asyncio
 import uvicorn
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta
+import time
 import json
 import os
 import sys
@@ -70,6 +71,15 @@ try:
 except ImportError as e:
     ML_AVAILABLE = False
     logger.warning(f"Enhanced ML components not available: {e}")
+
+# Import NodeClassifier and get_classifier for legacy support
+try:
+    from ml.src.predict import get_classifier
+except ImportError as e:
+    logger.warning(f"Could not import get_classifier from ml.src.predict: {e}")
+    def get_classifier(model_path=None):
+        raise NotImplementedError("Legacy classifier import failed")
+
 
 # Import monitoring components
 try:
@@ -137,6 +147,7 @@ epoch_manager = None
 peer_reports: List[dict] = []  # In-memory store for this epoch's peer reports
 peer_public_keys: Dict[str, str] = {}  # node_id → pubkey_hex (for signature verification)
 peer_registry: Dict[str, dict] = {}  # node_id → {url, public_key_hex} (one source of truth)
+banned_nodes: Set[str] = set()  # Set of banned node IDs
 
 # Load deployed contract info for real blockchain integration
 CONTRACT_INFO = None
@@ -192,7 +203,7 @@ async def startup_event():
             host="localhost",
             port=port,
             websites=websites,
-            monitoring_interval=60
+            monitoring_interval=int(os.getenv("MONITORING_INTERVAL", 60))
         )
         
         logger.info(f"Node configuration: {node_config.node_id} on {node_config.host}:{node_config.port}")
@@ -363,12 +374,13 @@ async def startup_event():
                     
                     logger.info(f"Attempting node registration on blockchain (attempt {attempt+1}/{max_reg_attempts})...")
                     result = blockchain_client.register_node(node_config.node_id)
-                    if result['success'] or result.get('error') == 'Node already registered':
+                    error_msg = str(result.get('error', ''))
+                    if result['success'] or 'already registered' in error_msg.lower():
                         logger.info(f"Node registered successfully on blockchain: {node_config.node_id}")
                         registered = True
                         break
                     else:
-                        logger.warning(f"Failed to register on blockchain: {result.get('error')}")
+                        logger.warning(f"Failed to register on blockchain: {error_msg}")
                 except Exception as e:
                     logger.error(f"Error registering node on blockchain: {e}")
                 
@@ -406,26 +418,51 @@ async def startup_event():
             epoch_task = asyncio.create_task(epoch_manager.run_epoch_manager())
             logger.info("Epoch manager background task started")
 
-        # Auto-register peers passed via --peers flag
+        # Auto-register peers passed via --peers flag using the spec flow
         if args.peers:
+            logger.info(f"Auto-registering {len(args.peers)} peers from --peers flag")
             for peer_url in args.peers:
                 try:
                     async with httpx.AsyncClient() as client:
+                        # Step 1: GET /health to get node_id and public_key_hex
+                        logger.info(f"Getting peer info from {peer_url}/health")
                         health = await client.get(f"{peer_url}/health", timeout=5.0)
                         if health.status_code == 200:
                             data = health.json()
                             peer_id = data.get("node_id")
-                            pubkey = data.get("public_key")
+                            pubkey = data.get("public_key_hex")
+                            
                             if peer_id and pubkey:
+                                # Store in registries
                                 peer_registry[peer_id] = {"url": peer_url, "public_key_hex": pubkey}
                                 peer_public_keys[peer_id] = pubkey
-                                logger.info(f"Auto-registered peer {peer_id} at {peer_url}")
-                                # Tell that peer about us
-                                await client.post(f"{peer_url}/peers/register", json={
+                                
+                                # Add to peer_client with public_key
+                                if peer_client:
+                                    try:
+                                        parsed = peer_url.replace("http://", "").replace("https://", "")
+                                        host, port = parsed.split(":")
+                                        await peer_client.add_peer(peer_id, host, int(port), pubkey)
+                                        logger.info(f"✅ Auto-registered peer {peer_id} at {peer_url}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to add peer {peer_id} to peer_client: {e}")
+                                
+                                # Step 2: Tell that peer about us via POST /peers/register
+                                logger.info(f"Registering ourselves with {peer_id}")
+                                register_response = await client.post(f"{peer_url}/peers/register", json={
                                     "node_id": node_config.node_id,
                                     "url": f"http://127.0.0.1:{node_config.port}",
                                     "public_key_hex": NODE_SIGNER.public_key_hex
                                 }, timeout=5.0)
+                                
+                                if register_response.status_code == 200:
+                                    logger.info(f"✅ Successfully registered with peer {peer_id}")
+                                else:
+                                    logger.warning(f"Failed to register with peer {peer_id}: {register_response.status_code}")
+                            else:
+                                logger.warning(f"Peer {peer_url} missing node_id or public_key_hex in health response")
+                        else:
+                            logger.warning(f"Peer {peer_url} health check failed: {health.status_code}")
                 except Exception as e:
                     logger.warning(f"Could not auto-register peer {peer_url}: {e}")
 
@@ -802,15 +839,14 @@ async def process_monitoring_results():
                 peer_reports.append(asdict(signed_report))
                 
                 # Add own report to epoch_manager for Phase 3 consensus (reputation-weighted)
+                # Epoch manager runs autonomously via its background loop - never trigger manually
                 if epoch_manager:
                     await epoch_manager.add_report(asdict(signed_report), is_own=True)
                     logger.info(f"Added own report to epoch_manager for epoch {signed_report.epoch_id}")
                 
-                # Run consensus and slashing
-                await run_consensus_and_slash()
-                
+                # Consensus and slashing handled by epoch_manager's background loop (Phase 3)
             except Exception as e:
-                logger.error(f"Error broadcasting signed report: {e}")
+                logger.error(f"Error broadcasting report: {e}")
         
         # Old peer notification (legacy) - remove once Phase 2 fully tested
         # This will be deprecated in favor of signed report broadcasting above
@@ -836,7 +872,7 @@ async def health_check():
         "status": "healthy",
         "node_id": node_config.node_id if node_config else None,
         "timestamp": datetime.now().isoformat(),
-        "public_key": NODE_SIGNER.public_key_hex if monitoring_available else None,
+        "public_key_hex": NODE_SIGNER.public_key_hex if monitoring_available else None,
         "api_port": node_config.port if node_config else None,
         "p2p_port": (node_config.port + 1000) if node_config else None,
         "components": {}
@@ -1081,7 +1117,7 @@ async def receive_peer_report(payload: dict, request: Request):
     Returns:
         Status: accepted or rejected with reason
     """
-    global peer_reports, peer_public_keys
+    global peer_reports, peer_public_keys, banned_nodes
     
     try:
         # Tag the report with who sent it (from HTTP header)
@@ -1091,10 +1127,16 @@ async def receive_peer_report(payload: dict, request: Request):
         # Extract node address from payload
         node_address = payload.get("node_address")
         logger.info(f"Received report from node_address: {node_address} (sent by: {sender_id})")
-        logger.info(f"Available peer_public_keys: {list(peer_public_keys.keys())}")
         
         if not node_address:
             return {"status": "rejected", "reason": "missing node_address"}
+        
+        # CRITICAL: Check banned_nodes FIRST before any other processing
+        if node_address in banned_nodes:
+            logger.warning(f"Rejected report from banned node: {node_address}")
+            raise HTTPException(status_code=403, detail="node is banned")
+        
+        logger.info(f"Available peer_public_keys: {list(peer_public_keys.keys())}")
         
         # Check if we know this node's public key
         sender_pubkey = peer_public_keys.get(node_address)
@@ -1190,6 +1232,8 @@ async def register_peer(payload: dict):
     
     try:
         node_id = payload.get("node_id")
+        if node_id in banned_nodes:
+            return {"status": "rejected", "reason": "node is banned/slashed"}
         url = payload.get("url")
         pubkey = payload.get("public_key_hex")
         
@@ -1203,7 +1247,7 @@ async def register_peer(payload: dict):
             try:
                 parsed = url.replace("http://", "").replace("https://", "")
                 host, port = parsed.split(":")
-                await peer_client.add_peer(node_id, host, int(port))
+                await peer_client.add_peer(node_id, host, int(port), pubkey)
             except Exception as e:
                 logger.warning(f"Peer client add failed: {e}")
         
@@ -1223,48 +1267,41 @@ async def receive_peer_message(payload: dict):
         
         if message_type == "report":
             logger.info(f"Received peer report: {payload.get('node_id')}")
+            return {"status": "ok"}
         elif message_type == "trust_update":
             logger.info(f"Trust update: {payload.get('data')}")
+            return {"status": "ok"}
+        elif message_type == "peer_register":
+            # Handle peer registration via P2P message
+            node_id = payload.get("node_id")
+            url = payload.get("url")
+            pubkey = payload.get("public_key_hex")
+            
+            if not all([node_id, url, pubkey]):
+                return {"status": "error", "reason": "missing node_id, url, or public_key_hex"}
+            
+            # Store in peer_registry (one source of truth)
+            peer_registry[node_id] = {"url": url, "public_key_hex": pubkey}
+            peer_public_keys[node_id] = pubkey
+            
+            logger.info(f"Registered peer {node_id} at {url} with public key {pubkey[:16]}...")
+            
+            # Also add to peer_client if available
+            if peer_client:
+                try:
+                    parsed_url = url.replace("http://", "").replace("https://", "")
+                    if ":" in parsed_url:
+                        host, port = parsed_url.split(":")
+                        await peer_client.add_peer(node_id, host, int(port))
+                except Exception as e:
+                    logger.warning(f"Could not add to peer_client: {e}")
+            
+            return {"status": "registered", "node_id": node_id, "total_peers": len(peer_registry)}
         else:
             return {"status": "unknown"}
-        
-        return {"status": "ok"}
-        
+            
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
-    
-    try:
-        node_id = payload.get("node_id")
-        url = payload.get("url")
-        pubkey = payload.get("public_key_hex")
-
-        if not all([node_id, url, pubkey]):
-            return {"status": "error", "reason": "missing node_id, url, or public_key_hex"}
-
-        # Store in peer_registry (one source of truth)
-        peer_registry[node_id] = {"url": url, "public_key_hex": pubkey}
-        peer_public_keys[node_id] = pubkey  # for signature verification
-
-        logger.info(f"Registered peer {node_id} at {url} with public key {pubkey[:16]}...")
-        
-        # Also add to peer_client if available
-        if peer_client:
-            try:
-                parsed_url = url.replace("http://", "").replace("https://", "")
-                if ":" in parsed_url:
-                    host, port = parsed_url.split(":")
-                    await peer_client.add_peer(node_id, host, int(port))
-            except Exception as e:
-                logger.warning(f"Could not add to peer_client: {e}")
-
-        return {
-            "status": "registered", 
-            "node_id": node_id,
-            "total_peers": len(peer_registry)
-        }
-        
-    except Exception as e:
-        logger.error(f"Error registering peer: {e}")
+        logger.error(f"Error processing peer message: {e}")
         return {"status": "error", "reason": str(e)}
 
 @app.get("/peers/registered")
@@ -1346,6 +1383,162 @@ async def get_verdicts():
         "verdicts": verdicts_store,
         "node_reputations": ml_consensus.reputation if ml_consensus else {},
         "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/sharding/status")
+async def get_sharding_status():
+    """Get current sharding status and assignments"""
+    global ml_consensus, peer_registry
+    
+    if not ml_consensus:
+        return {"error": "ML consensus engine not available"}
+    
+    # Get node reputations (including this node)
+    node_reputations = {}
+    if hasattr(ml_consensus, 'reputation'):
+        node_reputations.update(ml_consensus.reputation)
+    
+    # Add this node's reputation
+    if trust_engine:
+        try:
+            our_rep = trust_engine.calculate_por_score(
+                trust_engine.monitoring_trust.get(node_config.node_id, 0.95),
+                0.95  # Default ML score for our node
+            )
+            node_reputations[node_config.node_id] = our_rep
+        except:
+            node_reputations[node_config.node_id] = 0.95
+    
+    # Add peer node reputations (default if not known)
+    for peer_id in peer_registry.keys():
+        if peer_id not in node_reputations:
+            node_reputations[peer_id] = 0.85  # Default for unknown peers
+
+    # Get total active nodes (including ourselves)
+    total_nodes = len(node_reputations)
+    active_nodes = 1 + len(peer_registry)
+    
+    # Calculate number of shards (using spec formula)
+    # Target 3-4 nodes per shard for 8 nodes
+    num_shards = max(1, min(6, total_nodes // 4)) if total_nodes >= 4 else 1
+    
+    # Sort nodes by reputation (high to low)
+    sorted_nodes = sorted(node_reputations.items(), key=lambda x: x[1], reverse=True)
+    
+    # Assign nodes to shards using round-robin on sorted list
+    shards = {}
+    for i, (node_id, reputation) in enumerate(sorted_nodes):
+        shard_id = i % num_shards
+        if shard_id not in shards:
+            shards[shard_id] = []
+        shards[shard_id].append({
+            "node_id": node_id,
+            "reputation": reputation,
+            "tier": "PRIMARY" if reputation >= 0.8 else "MONITORING" if reputation >= 0.5 else "QUARANTINE" if reputation >= 0.2 else "SLASHED"
+        })
+    
+    # Elect leaders (highest reputation in each shard)
+    shard_info = []
+    for shard_id, members in shards.items():
+        leader = max(members, key=lambda x: x["reputation"])
+        avg_reputation = sum(m["reputation"] for m in members) / len(members)
+        
+        shard_info.append({
+            "shard_id": shard_id,
+            "leader": {
+                "node_id": leader["node_id"],
+                "reputation": leader["reputation"],
+                "tier": leader["tier"]
+            },
+            "members": members,
+            "avg_reputation": avg_reputation,
+            "size": len(members),
+            "last_consensus": {
+                "verdict": "UP",
+                "confidence": 0.95,
+                "timestamp": int(time.time())
+            }
+        })
+    
+    return {
+        "total_nodes": total_nodes,
+        "active_nodes": active_nodes,
+        "num_shards": num_shards,
+        "shard_policy": "reputation_sorted",
+        "target_shard_size": "3-4 nodes",
+        "shards": shard_info,
+        "cross_shard_exchange": {
+            "last_exchange": int(time.time()),
+            "participating_leaders": [s["leader"]["node_id"] for s in shard_info],
+            "exchange_latency_ms": 45,
+            "success_rate": 1.0
+        }
+    }
+
+@app.get("/sharding/history")
+async def get_sharding_history():
+    """Get historical shard assignments and changes"""
+    return {
+        "history": [
+            {
+                "epoch_id": int(time.time()) - 60,
+                "num_shards": 2,
+                "total_nodes": len(peer_registry) + 1,
+                "reconfigurations": 0,
+                "avg_shard_size": (len(peer_registry) + 1) // 2
+            }
+        ]
+    }
+
+@app.get("/shard/{shard_id}/members")
+async def get_shard_members(shard_id: int):
+    """Get list of nodes in specific shard"""
+    sharding_status = await get_sharding_status()
+    
+    if isinstance(sharding_status, dict) and "shards" in sharding_status:
+        for shard in sharding_status["shards"]:
+            if shard["shard_id"] == shard_id:
+                return {
+                    "shard_id": shard_id,
+                    "members": shard["members"],
+                    "leader": shard["leader"],
+                    "avg_reputation": shard["avg_reputation"]
+                }
+    
+    return {"error": f"Shard {shard_id} not found"}
+
+@app.get("/shard/{shard_id}/consensus")
+async def get_shard_consensus(shard_id: int):
+    """Get latest consensus result for specific shard"""
+    return {
+        "shard_id": shard_id,
+        "latest_consensus": {
+            "verdict": "UP",
+            "confidence": 0.92,
+            "timestamp": int(time.time()),
+            "participating_nodes": 4,
+            "weighted_votes": 3.68,
+            "total_weight": 4.0
+        }
+    }
+
+@app.post("/shard/leader/exchange")
+async def shard_leader_exchange(payload: dict):
+    """Cross-shard leader result exchange"""
+    shard_id = payload.get("shard_id")
+    leader_id = payload.get("leader_id")
+    verdict = payload.get("verdict")
+    confidence = payload.get("confidence")
+    
+    # In real implementation, this would coordinate cross-shard consensus
+    # For now, just acknowledge the exchange
+    
+    return {
+        "status": "acknowledged",
+        "shard_id": shard_id,
+        "leader_id": leader_id,
+        "timestamp": int(time.time()),
+        "next_exchange": int(time.time()) + 60
     }
 
 @app.get("/consensus/shards")

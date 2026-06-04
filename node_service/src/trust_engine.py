@@ -480,6 +480,7 @@ class TrustCalculator:
     def calculate_por_score(monitoring_trust: float, ml_score: float) -> float:
         """
         Calculate Proof of Reputation score
+        Formula: PoR = 0.6 * monitoring_trust + 0.4 * ml_score
         
         Args:
             monitoring_trust: Monitoring trust score (0-1)
@@ -488,7 +489,7 @@ class TrustCalculator:
         Returns:
             PoR score (0-1)
         """
-        return 0.4 * (monitoring_trust or 0.0) + 0.6 * (ml_score or 0.0)
+        return 0.6 * (monitoring_trust or 0.0) + 0.4 * (ml_score or 0.0)
     
     @staticmethod
     def get_trust_level(score: float) -> str:

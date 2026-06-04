@@ -7,6 +7,7 @@
     "event NodeSlashed(string indexed,uint256,string,uint256 indexed)",
     "event ReportSubmitted(string indexed,bool)",
     "event ReputationUpdated(string indexed,uint256,uint256,uint256)",
+    "function addressToNodeId(address) view returns (string)",
     "function batchSlashNodes(string[],uint256[],string,uint256)",
     "function batchUpdateReputation(string[],uint256[],uint256[])",
     "function epochDecisionsSubmitted(uint256) view returns (bool)",

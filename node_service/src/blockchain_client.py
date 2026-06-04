@@ -248,7 +248,7 @@ class BlockchainClient:
 
     
     def _send_transaction(self, function_call, value: int = 0) -> Dict:
-        """Send transaction to blockchain with local nonce safety and retries"""
+        """Send transaction to blockchain with local nonce safety and 5 retries with 3-second delays"""
         self._ensure_ready()
         
         if not hasattr(self, '_nonce_lock'):
@@ -257,7 +257,7 @@ class BlockchainClient:
             self._local_nonce = None
             
         with self._nonce_lock:
-            for attempt in range(3):
+            for attempt in range(5):  # 5 retries as per spec
                 try:
                     # Fetch fresh pending count if local nonce is not initialized or lower
                     pending_nonce = self.w3.eth.get_transaction_count(self.account.address, 'pending')
@@ -305,11 +305,12 @@ class BlockchainClient:
                         
                 except Exception as e:
                     err_msg = str(e)
-                    logger.warning(f"Transaction attempt {attempt + 1} failed: {err_msg}")
+                    logger.warning(f"Transaction attempt {attempt + 1}/5 failed: {err_msg}")
                     # If nonce is too low or transaction is already known, reset local nonce and retry
                     if any(x in err_msg.lower() for x in ["nonce too low", "already known", "underpriced"]):
                         self._local_nonce = None
-                        time.sleep(1)
+                        if attempt < 4:  # Don't sleep on last attempt
+                            time.sleep(3)  # 3-second delay as per spec
                         continue
                     else:
                         self._local_nonce = None
@@ -320,7 +321,7 @@ class BlockchainClient:
             
             return {
                 'success': False,
-                'error': "Failed to send transaction after multiple attempts due to nonce/network issues"
+                'error': "Failed to send transaction after 5 attempts due to nonce/network issues"
             }
     
     def register_node(self, node_id: str) -> Dict:
@@ -406,7 +407,7 @@ class BlockchainClient:
         This reduces blockchain transactions from O(n) to O(1) per epoch
         
         Args:
-            updates: List of dicts with keys: node_id, new_por, evidence
+            updates: List of dicts with keys: node_id, monitoring_trust, ml_score
             
         Returns:
             Transaction result
@@ -429,13 +430,13 @@ class BlockchainClient:
                 
                 return result
             else:
-                # Fallback: sequential updates (still better than per-monitoring-cycle)
+                # Fallback: sequential updates using monitoring_trust and ml_score keys
                 results = []
                 for update in updates:
                     result = self.update_reputation(
                         update['node_id'],
-                        update['new_por'],
-                        update['new_por'],
+                        update['monitoring_trust'],
+                        update['ml_score'],
                         evidence=update.get('evidence', '')
                     )
                     results.append(result)
@@ -879,7 +880,7 @@ class BlockchainClient:
         Returns:
             PoR score (0-1)
         """
-        return 0.4 * monitoring_trust + 0.6 * ml_score
+        return 0.6 * monitoring_trust + 0.4 * ml_score
     
     def health_check(self) -> Dict:
         """Check blockchain connection and contract availability"""

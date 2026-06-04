@@ -58,6 +58,9 @@ class EnhancedMLConsensusEngine:
         # History buffers
         self.node_latency_history = defaultdict(list)
         self.node_failure_history = defaultdict(list)
+        self.node_ssl_history = defaultdict(list)
+        self.node_agreement_history = defaultdict(list)
+        self.node_report_times = defaultdict(list)
         self.history_window_size = 50
         
         # ML Models (ML_MINOR approach)
@@ -143,6 +146,161 @@ class EnhancedMLConsensusEngine:
                 }
         return status_map
 
+    def _assign_nodes_to_shards(self):
+        """Assign nodes to shards based on current reputations"""
+        self.shards = {
+            'PRIMARY': [],
+            'MONITORING': [],
+            'QUARANTINE': [],
+            'SLASHED': []
+        }
+        # Use reputations if ewma_reputations is empty
+        source = self.ewma_reputations if self.ewma_reputations else self.reputation
+        for node_id, rep in source.items():
+            decision = self.apply_mitigation_policy(rep)
+            self.shards[decision.shard].append(node_id)
+        logger.info(f"Assigned nodes to shards: {[(k, len(v)) for k, v in self.shards.items()]}")
+
+    def sync_state(self, reputations: Dict[str, float], mitigation_actions: Dict[str, Dict]):
+        """Sync local state with external source of truth (e.g. leader decision)"""
+        for node_id, rep in reputations.items():
+            self.reputation[node_id] = rep
+            self.ewma_reputations[node_id] = rep
+            
+        for node_id, action_dict in mitigation_actions.items():
+            if isinstance(action_dict, dict):
+                self.mitigation_actions[node_id] = MitigationDecision(
+                    status=action_dict.get("status", "HEALTHY"),
+                    action=action_dict.get("action", "ALLOW"),
+                    shard=action_dict.get("shard", "PRIMARY")
+                )
+        
+        # Re-assign shards based on new reputations
+        self._assign_nodes_to_shards()
+        self.save_state()
+
+    def process_sharded_consensus(self, epoch_id: int, reports: List[Dict]) -> Dict:
+        """
+        Process consensus using sharded approach with cross-shard communication
+        """
+        logger.info(f"🚀 STARTING SHARDED CONSENSUS for epoch {epoch_id}")
+        
+        # Ensure shards are assigned
+        if not hasattr(self, 'shards') or not self.shards:
+            self._assign_nodes_to_shards()
+        
+        # Group reports by shard
+        shard_reports = defaultdict(list)
+        for report in reports:
+            node_id = report.get('node_id') or report.get('node_address', 'unknown')
+            
+            # Find which shard this node belongs to
+            node_shard = None
+            for shard_id, members in self.shards.items():
+                if node_id in members:
+                    node_shard = shard_id
+                    break
+            
+            if node_shard is not None:
+                shard_reports[node_shard].append(report)
+            else:
+                # Unassigned node, find its shard based on reputation
+                rep = self.ewma_reputations.get(node_id, 0.90)
+                decision = self.apply_mitigation_policy(rep)
+                shard_reports[decision.shard].append(report)
+        
+        # Run intra-shard consensus for each shard
+        shard_results = {}
+        for shard_id in self.shards.keys():
+            shard_verdict = self._run_intra_shard_consensus(shard_id, shard_reports[shard_id])
+            shard_results[shard_id] = shard_verdict
+            logger.info(f"Shard {shard_id} verdict: {shard_verdict['verdict']} (confidence: {shard_verdict['confidence']:.3f})")
+        
+        # Cross-shard consensus (majority vote among shard verdicts)
+        global_verdict = self._run_cross_shard_consensus(shard_results)
+        
+        # Update reputations based on global consensus
+        reputation_updates = self._update_reputations_from_consensus(global_verdict, reports)
+        
+        # Apply policies to results
+        mitigation_actions = {}
+        for node_id, rep in self.reputation.items():
+            decision = self.apply_mitigation_policy(rep)
+            self.mitigation_actions[node_id] = decision
+            mitigation_actions[node_id] = {
+                'status': decision.status,
+                'action': decision.action,
+                'shard': decision.shard
+            }
+        
+        # Final Step: Persist state after each epoch
+        self.save_state()
+        
+        return {
+            'global_verdict': global_verdict,
+            'shard_results': shard_results,
+            'reputations': self.reputation,
+            'ewma_reputations': self.ewma_reputations,
+            'mitigation_actions': mitigation_actions,
+            'num_shards': len(self.shards),
+            'processing_time_ms': 50  # Placeholder
+        }
+
+    def _update_reputations_from_consensus(self, global_verdict: Dict, reports: List[Dict]) -> Dict:
+        """
+        Update node reputations based on agreement with global consensus
+        """
+        reputation_updates = {}
+        
+        for report in reports:
+            node_id = report.get('node_id') or report.get('node_address', 'unknown')
+            status = report.get('status', 'error')
+            node_verdict = 'UP' if status == 'success' or report.get('is_reachable') else 'DOWN'
+            
+            # Check if node agreed with global consensus
+            agreed = (node_verdict == global_verdict['verdict'])
+            
+            # Update reputation
+            current_rep = self.reputation.get(node_id, 0.95)
+            if agreed:
+                # Small reward for agreement
+                new_rep = min(1.0, current_rep + 0.01)
+            else:
+                # Penalty for disagreement
+                new_rep = max(0.0, current_rep - 0.15)
+                
+            self.reputation[node_id] = new_rep
+            reputation_updates[node_id] = new_rep
+            
+            # ALSO update EWMA
+            self.apply_ewma_smoothing(node_id, new_rep)
+        
+        return reputation_updates
+
+    def get_shard_assignment(self, num_shards: int = 4) -> Dict[str, int]:
+        """
+        Get shard assignment based on reputation sorting
+        
+        Args:
+            num_shards: Number of shards to create
+            
+        Returns:
+            Dict mapping node_id -> shard_id
+        """
+        if not self.reputation:
+            return {}
+        
+        # Sort nodes by reputation (high to low) 
+        sorted_nodes = sorted(self.reputation.items(), key=lambda x: x[1], reverse=True)
+        
+        # Round-robin assignment to distribute high/low rep nodes evenly
+        assignment = {}
+        for i, (node_id, reputation) in enumerate(sorted_nodes):
+            shard_id = i % num_shards
+            assignment[node_id] = shard_id
+        
+        return assignment
+
     def get_shard_distribution(self) -> Dict[str, int]:
         """Get the number of nodes in each shard"""
         dist = {"PRIMARY": 0, "MONITORING": 0, "QUARANTINE": 0, "SLASHED": 0}
@@ -150,6 +308,19 @@ class EnhancedMLConsensusEngine:
             decision = self.apply_mitigation_policy(ewma)
             dist[decision.shard] += 1
         return dist
+
+    def _assign_nodes_to_shards(self):
+        """Assign nodes to shards based on current reputations"""
+        self.shards = {
+            'PRIMARY': [],
+            'MONITORING': [],
+            'QUARANTINE': [],
+            'SLASHED': []
+        }
+        for node_id, rep in self.ewma_reputations.items():
+            decision = self.apply_mitigation_policy(rep)
+            self.shards[decision.shard].append(node_id)
+        logger.info(f"Assigned nodes to shards: {[(k, len(v)) for k, v in self.shards.items()]}")
     
     def save_state(self):
         """Save current reputation state to disk"""
@@ -173,7 +344,12 @@ class EnhancedMLConsensusEngine:
                     state = json.load(f)
                 self.reputation = state.get('reputation', {})
                 self.ewma_reputations = state.get('ewma_reputations', {})
-                logger.info(f"📂 Loaded reputation state for {len(self.reputation)} nodes")
+                
+                # Apply mitigation policy to loaded reputations to initialize tiers
+                for nid, rep in self.reputation.items():
+                    self.mitigation_actions[nid] = self.apply_mitigation_policy(rep)
+                
+                logger.info(f"📂 Loaded reputation state for {len(self.reputation)} nodes and initialized tiers")
             except Exception as e:
                 logger.error(f"Failed to load reputation state: {e}")
         else:
@@ -184,6 +360,7 @@ class EnhancedMLConsensusEngine:
         try:
             # Try multiple possible paths for models
             possible_paths = [
+                os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models')),
                 os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'ML_MINOR', 'models'),
                 os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), 'ML_MINOR', 'models'),
                 os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'ML_MINOR', 'models')),
@@ -494,44 +671,195 @@ class EnhancedMLConsensusEngine:
         self.mitigation_actions[node_id] = decision
         
         return smoothed_reputation, decision
-    
-    def extract_features_from_report(self, report: Dict) -> Dict:
-        """Extract features from a single monitoring report (singular)"""
-        features = {}
+
+    def extract_features_from_report(self, report: Dict, majority_verdicts: Optional[Dict[str, bool]] = None) -> Dict:
+        """
+        Extract features from a single monitoring report.
+        Computes both RIPE Atlas features and the 11 correct features for ML model.
+        """
+        # Default features if report is incomplete
+        features = {
+            # 8 RIPE Atlas features
+            'avg_latency': 150.0,
+            'latency_var': 100.0,
+            'std_latency': 10.0,
+            'skewness': 0.0,
+            'kurtosis': 0.0,
+            'p95_latency': 180.0,
+            'max_latency': 200.0,
+            'failure_rate': 0.0,
+            
+            # 11 Correct features
+            'peer_agreement_rate': 0.95,
+            'ssl_accuracy': 0.95,
+            'avg_rt_error': 0.05,
+            'report_consistency': 0.95,
+            'sudden_change_score': 0.05,
+            'uptime_deviation': 0.05,
+            'rt_consistency': 0.95,
+            'itt_jitter': 0.05,
+            'accuracy': 0.95,
+            'false_positive_rate': 0.02,
+            'false_negative_rate': 0.02,
+        }
         
-        # Basic monitoring features
-        features['accuracy'] = report.get('accuracy', 0.0)
-        features['false_positive_rate'] = report.get('false_positive_rate', 0.0)
-        features['false_negative_rate'] = report.get('false_negative_rate', 0.0)
-        features['avg_rt_error'] = report.get('avg_rt_error', 0.0)
-        features['max_rt_error'] = report.get('max_rt_error', 0.0)
-        features['peer_agreement_rate'] = report.get('peer_agreement_rate', 0.0)
-        features['historical_accuracy'] = report.get('historical_accuracy', 0.0)
-        features['accuracy_std_dev'] = report.get('accuracy_std_dev', 0.0)
-        features['report_consistency'] = report.get('report_consistency', 0.0)
-        features['sudden_change_score'] = report.get('sudden_change_score', 0.0)
-        features['ssl_accuracy'] = report.get('ssl_accuracy', 0.0)
-        features['uptime_deviation'] = report.get('uptime_deviation', 0.0)
-        features['rt_consistency'] = report.get('rt_consistency', 0.0)
+        # Extract node_id to track history
+        node_id = report.get('node_id') or report.get('node_address', 'unknown')
         
-        # Behavioral features for anomaly detection
-        features['itt_jitter'] = report.get('itt_jitter', 0.0)
-        features['response_time_variance'] = report.get('response_time_variance', 0.0)
-        features['report_frequency'] = report.get('report_frequency', 0.0)
-        features['timeout_rate'] = report.get('timeout_rate', 0.0)
-        features['error_burst_score'] = report.get('error_burst_score', 0.0)
+        # Get current latency and failure status
+        current_latency = report.get('response_ms', report.get('response_time_ms', -1))
+        is_failure = (report.get('status') == 'error' or 
+                     report.get('http_status', 0) == 0 or
+                     current_latency < 0)
         
+        # Update history buffers
+        if current_latency >= 0:
+            self.node_latency_history[node_id].append(current_latency)
+            if len(self.node_latency_history[node_id]) > self.history_window_size:
+                self.node_latency_history[node_id].pop(0)
+        
+        self.node_failure_history[node_id].append(1 if is_failure else 0)
+        if len(self.node_failure_history[node_id]) > self.history_window_size:
+            self.node_failure_history[node_id].pop(0)
+            
+        ssl_valid = report.get('ssl_valid', True)
+        self.node_ssl_history[node_id].append(1 if ssl_valid else 0)
+        if len(self.node_ssl_history[node_id]) > self.history_window_size:
+            self.node_ssl_history[node_id].pop(0)
+            
+        timestamp = report.get('timestamp') or time.time()
+        self.node_report_times[node_id].append(timestamp)
+        if len(self.node_report_times[node_id]) > self.history_window_size:
+            self.node_report_times[node_id].pop(0)
+            
+        url = report.get('url')
+        is_reachable = report.get('is_reachable', True)
+        if majority_verdicts and url in majority_verdicts:
+            agreed = (is_reachable == majority_verdicts[url])
+        else:
+            agreed = True
+            
+        self.node_agreement_history[node_id].append(1 if agreed else 0)
+        if len(self.node_agreement_history[node_id]) > self.history_window_size:
+            self.node_agreement_history[node_id].pop(0)
+        
+        # Get history lists
+        latencies = self.node_latency_history[node_id]
+        failures = self.node_failure_history[node_id]
+        ssls = self.node_ssl_history[node_id]
+        agreements = self.node_agreement_history[node_id]
+        timestamps = self.node_report_times[node_id]
+        
+        if len(latencies) > 0:
+            latency_array = np.array(latencies)
+            avg_lat = float(np.mean(latency_array))
+            features['avg_latency'] = avg_lat
+            features['latency_var'] = float(np.var(latency_array))
+            features['std_latency'] = float(np.std(latency_array))
+            
+            if len(latencies) >= 3:
+                mean = np.mean(latency_array)
+                std = np.std(latency_array)
+                if std > 0:
+                    features['skewness'] = float(np.mean(((latency_array - mean) / std) ** 3))
+            
+            if len(latencies) >= 4:
+                mean = np.mean(latency_array)
+                std = np.std(latency_array)
+                if std > 0:
+                    features['kurtosis'] = float(np.mean(((latency_array - mean) / std) ** 4) - 3)
+            
+            features['p95_latency'] = float(np.percentile(latency_array, 95))
+            features['max_latency'] = float(np.max(latency_array))
+            
+            features['rt_consistency'] = float(max(0.0, 1.0 - (np.std(latency_array) / (avg_lat + 1e-9))))
+            features['sudden_change_score'] = float(min(1.0, abs(current_latency - avg_lat) / (avg_lat + 1e-9)))
+ 
+        if len(failures) > 0:
+            fail_rate = float(np.mean(failures))
+            features['failure_rate'] = fail_rate
+            features['uptime_deviation'] = fail_rate
+            
+        if len(ssls) > 0:
+            features['ssl_accuracy'] = float(np.mean(ssls))
+            
+        if len(agreements) > 0:
+            agreement_rate = float(np.mean(agreements))
+            features['peer_agreement_rate'] = agreement_rate
+            features['accuracy'] = agreement_rate
+            
+            false_reports = 1.0 - agreement_rate
+            features['false_positive_rate'] = float(false_reports * fail_rate) if len(failures) > 0 else 0.0
+            features['false_negative_rate'] = float(false_reports * (1.0 - fail_rate)) if len(failures) > 0 else 0.0
+            
+        features['avg_rt_error'] = float(min(1.0, abs(features['avg_latency'] - 150.0) / 1000.0))
+        
+        if len(timestamps) > 1:
+            diffs = np.diff(timestamps)
+            jitter = float(np.std(diffs))
+            features['itt_jitter'] = float(min(1.0, jitter / 60.0))
+            features['report_consistency'] = float(np.mean(diffs < 120))
+            
+        return features      
         return features
     
+    def _extract_features_from_reports(self, reports: List[Dict]) -> Dict[str, Dict]:
+        """
+        Internal method: Extract features from multiple reports per node
+        """
+        node_features = {}
+        
+        # Group reports by node
+        reports_by_node = defaultdict(list)
+        for report in reports:
+            node_id = report.get('node_id') or report.get('node_address', 'unknown')
+            reports_by_node[node_id].append(report)
+            
+        # Compute majority verdicts for URLs in this epoch
+        majority_verdict_by_url = {}
+        reports_by_url = defaultdict(list)
+        for r in reports:
+            url = r.get('url')
+            if url:
+                reports_by_url[url].append(r)
+        for url, url_reports in reports_by_url.items():
+            votes = [1 if r.get('is_reachable', True) else 0 for r in url_reports]
+            majority_verdict_by_url[url] = (np.mean(votes) >= 0.5) if votes else True
+
+        # Extract features for each node
+        for node_id, node_reports in reports_by_node.items():
+            # Process each report to update history
+            latest_features = {}
+            for report in node_reports:
+                latest_features = self.extract_features_from_report(report, majority_verdict_by_url)
+            
+            node_features[node_id] = latest_features
+        
+        return node_features
+    
     def extract_features_from_reports(self, reports: List[Dict]) -> pd.DataFrame:
-        """Extract features from multiple reports and return DataFrame (plural - for epoch_manager)"""
+        """
+        Extract features from multiple reports and return DataFrame (plural - for epoch_manager)
+        Uses the internal _extract_features_from_reports method for consistency
+        
+        Args:
+            reports: List of monitoring reports
+            
+        Returns:
+            DataFrame with 8 RIPE Atlas features per node
+        """
         if not reports:
             return pd.DataFrame()
         
+        # Use internal method to extract features
+        node_features = self._extract_features_from_reports(reports)
+        
+        # Convert to DataFrame
         features_list = []
-        for report in reports:
-            features = self.extract_features_from_report(report)
-            features_list.append(features)
+        for node_id, features in node_features.items():
+            feature_row = features.copy()
+            feature_row['node_id'] = node_id
+            features_list.append(feature_row)
         
         df = pd.DataFrame(features_list)
         return df
@@ -597,11 +925,11 @@ class EnhancedMLConsensusEngine:
         
         # High Performance Pass 1: Extract features for ALL nodes
         all_node_ids = list(reports_by_sender.keys())
+        node_features_dict = self._extract_features_from_reports(reports)
+        
         features_to_predict = []
         for sender_id in all_node_ids:
-            sender_reports = reports_by_sender[sender_id]
-            # Extract per‑node features (no extra context argument)
-            features = self.extract_features_from_reports(sender_reports)
+            features = node_features_dict.get(sender_id, {}).copy()
             features['collusion_score'] = 0.0
             features_to_predict.append(features)
         
@@ -651,60 +979,6 @@ class EnhancedMLConsensusEngine:
         self.save_state()
         
         return results
-
-
-        """Extract 8 statistical latency and failure features for ML consensus.
-        Uses rolling history buffers (window size self.history_window_size) to compute statistics.
-        Returns a dict with keys: avg_latency, latency_variance, std_latency, skewness, kurtosis, p95_latency, max_latency, failure_rate.
-        """
-        if not sender_reports:
-            return {}
-
-        # Extract latency values from current reports
-        current_latencies = [r.get("response_ms") or r.get("response_time_ms") for r in sender_reports if r.get("response_ms") or r.get("response_time_ms")]
-        # Failure indicator (1 if not reachable, else 0)
-        current_failures = [0 if r.get("is_reachable", True) else 1 for r in sender_reports]
-
-        # Update rolling latency history
-        latency_hist = self.node_latency_history[sender_id]
-        latency_hist.extend(current_latencies)
-        if len(latency_hist) > self.history_window_size:
-            del latency_hist[:len(latency_hist) - self.history_window_size]
-
-        # Update rolling failure history
-        failure_hist = self.node_failure_history[sender_id]
-        failure_hist.extend(current_failures)
-        if len(failure_hist) > self.history_window_size:
-            del failure_hist[:len(failure_hist) - self.history_window_size]
-
-        # Compute statistics from history (fallback to current if history empty)
-        if latency_hist:
-            series = pd.Series(latency_hist)
-            avg_latency = series.mean()
-            latency_variance = series.var()
-            std_latency = series.std()
-            skewness = series.skew()
-            kurtosis = series.kurt()
-            p95_latency = np.percentile(series, 95)
-            max_latency = series.max()
-        else:
-            avg_latency = latency_variance = std_latency = skewness = kurtosis = p95_latency = max_latency = 0.0
-
-        failure_rate = float(sum(failure_hist) / len(failure_hist)) if failure_hist else 0.0
-
-        features = {
-            "avg_latency": float(avg_latency),
-            "latency_variance": float(latency_variance),
-            "std_latency": float(std_latency),
-            "skewness": float(skewness),
-            "kurtosis": float(kurtosis),
-            "p95_latency": float(p95_latency),
-            "max_latency": float(max_latency),
-            "failure_rate": float(failure_rate),
-        }
-
-        logger.debug(f"Features for sender {sender_id}: {features}")
-        return features
 
     def _update_collusion_graph(self, reports: List[Dict]):
         """Update the collusion detection graph based on reports"""
