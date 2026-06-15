@@ -608,11 +608,14 @@ class EnhancedMLConsensusEngine:
             logger.debug(f"RF features scaled: {rf_scaled}")
             
             # Get RF probability
-            # FIX: class 0 = HONEST, class 1 = MALICIOUS. Use P(honest) = class 0 probability.
             rf_all = self.rf_model.predict_proba(rf_scaled)
+            # Class 0 = HONEST, Class 1 = MALICIOUS
             honest_idx = list(self.rf_model.classes_).index(0) if 0 in self.rf_model.classes_ else 0
-            rf_prob = float(rf_all[:, honest_idx][0])
-            logger.debug(f"RF probability (honest): {rf_prob}")
+            malicious_idx = 1 if honest_idx == 0 else 0
+            
+            rf_prob_honest = float(rf_all[:, honest_idx][0])
+            rf_prob_malicious = float(rf_all[:, malicious_idx][0])
+            logger.debug(f"RF probabilities: honest={rf_prob_honest}, malicious={rf_prob_malicious}")
             
             # Prepare behavioral features for Isolation Forest
             beh_features = []
@@ -780,7 +783,8 @@ class EnhancedMLConsensusEngine:
                 mean = np.mean(latency_array)
                 std = np.std(latency_array)
                 if std > 0:
-                    features['kurtosis'] = float(np.mean(((latency_array - mean) / std) ** 4) - 3)
+                    # Raw Kurtosis moment formula (not excess kurtosis)
+                    features['kurtosis'] = float(np.mean(((latency_array - mean) / std) ** 4))
             
             features['p95_latency'] = float(np.percentile(latency_array, 95)) / 1000.0
             features['max_latency'] = float(np.max(latency_array)) / 1000.0
@@ -1168,5 +1172,32 @@ class MLConsensusEngine(EnhancedMLConsensusEngine):
         # Convert to malicious probability
         malicious = [1.0 - r for r in reputations]
         return pd.DataFrame({"p_malicious": malicious})
+
+    pass
+    """Legacy alias to load enhanced models."""
+        self.load_enhanced_models()
+
+    def predict_malicious_probability(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Legacy wrapper for prediction.
+
+        Takes a DataFrame where each row is a feature set, computes the enhanced
+        reputation (probability of *honest*) via `calculate_enhanced_reputation`,
+        then returns a DataFrame with a single column `p_malicious` representing
+        the probability of being malicious (i.e. 1 - reputation).
+        """
+        if features_df.empty:
+            return pd.DataFrame(columns=["p_malicious"])
+        # Compute reputation for each row
+        reputations = [
+            self.calculate_enhanced_reputation(row.to_dict())
+            for _, row in features_df.iterrows()
+        ]
+        # Convert to malicious probability
+        malicious = [1.0 - r for r in reputations]
+        return pd.DataFrame({"p_malicious": malicious})
+
+    pass
+urn pd.DataFrame({"p_malicious": malicious})
 
     pass

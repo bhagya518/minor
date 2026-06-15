@@ -109,18 +109,29 @@ class LeaderElectionManager:
         """
         Return {shard_index: leader_node_id}.
         Each shard member is a dict with keys 'node_id', 'reputation', 'tier'.
+        Phase 14: Weighted Random Sampling
+        Pi = Rep_i / sum(Rep_j)
         """
         leaders: Dict[int, Optional[str]] = {}
+        # Set seed for deterministic weighted sampling per epoch
+        random.seed(epoch_id * 1337)
+        
         for sid, members in shards.items():
             if not members:
                 leaders[sid] = None
                 continue
-            # Slide 21: Highest Reputation Node -> Shard Leader
-            best = max(
-                members,
-                key=lambda m: m["reputation"]
-            )
-            leaders[sid] = best["node_id"]
+            
+            # Step 1: Extract reputations as weights
+            node_ids = [m["node_id"] for m in members]
+            reputations = [max(0.0001, m["reputation"]) for m in members] # Prevent zero weights
+            
+            # Step 2: Weighted Random Selection (Phase 14)
+            # Pi = Rep_i / sum(Rep_j)
+            chosen_list = random.choices(node_ids, weights=reputations, k=1)
+            leaders[sid] = chosen_list[0]
+            
+            logger.info(f"Phase 14: Shard {sid} leader elected via weighted random sampling: {leaders[sid]}")
+            
         return leaders
 
 
