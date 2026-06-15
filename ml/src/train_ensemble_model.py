@@ -37,21 +37,16 @@ class EnsembleNodeClassifier:
         self.model_output_path = model_output_path
         self.scaler = StandardScaler()
         
-        # 20 features from proposed architecture
+        # 8 RIPE features from proposed architecture
         self.feature_columns = [
-            'accuracy',              # F01 - accuracy rate
-            'false_positive_rate',   # F02 - false positive rate
-            'false_negative_rate',   # F03 - false negative rate  
-            'avg_rt_error',          # F04 - response time deviation
-            'max_rt_error',          # F05 - max response time error
-            'peer_agreement_rate',   # F06 - agreement with peers
-            'historical_accuracy',   # F07 - historical accuracy
-            'accuracy_std_dev',      # F08 - accuracy consistency
-            'report_consistency',    # F09 - report consistency
-            'sudden_change_score',   # F10 - sudden behavior change
-            'ssl_accuracy',          # F11 - SSL detection accuracy
-            'uptime_deviation',      # F12 - uptime deviation
-            'rt_consistency'         # F13 - response time consistency
+            'avg_latency',      # F01 - Mean response time
+            'latency_var',      # F02 - Variance of latencies
+            'std_latency',      # F03 - Standard deviation
+            'skewness',         # F04 - Skewness of distribution
+            'kurtosis',         # F05 - Kurtosis (tailedness)
+            'p95_latency',      # F06 - 95th percentile
+            'max_latency',      # F07 - Maximum latency
+            'failure_rate'      # F08 - Failure rate
         ]
         
         # Models

@@ -212,14 +212,18 @@ async def startup_event():
         if monitoring_available:
             set_node_id(node_config.node_id)
             
-            # Set node mode (honest or malicious) from environment variable
+            # Set node mode from environment variable
             import os
             node_mode = os.environ.get('NODE_MODE', 'honest').lower()
-            if node_mode in ['honest', 'malicious']:
+            if node_mode in ['honest', 'malicious', 'faulty', 'suspicious']:
                 set_node_mode(node_mode)
                 logger.warning(f"🚨 Node mode set to: {node_mode.upper()}")
                 if node_mode == 'malicious':
                     logger.warning("🚨 This node will generate FALSE reports for testing!")
+                elif node_mode == 'faulty':
+                    logger.warning("🚨 This node will simulate faulty behavior (50% failures) for testing!")
+                elif node_mode == 'suspicious':
+                    logger.warning("🚨 This node will simulate suspicious behavior (25% anomalies) for testing!")
         
         # Initialize components
         website_monitor = WebsiteMonitor()
@@ -228,6 +232,12 @@ async def startup_event():
         # Initialize peer client (it will compute its own P2P port as API port + 1000)
         peer_client = PeerClient(node_config.node_id, node_config.host, node_config.port)
         await peer_client.start_server()
+        
+        # Attach peer_client to blockchain_client for broadcasting (Phase 3)
+        if blockchain_client:
+            blockchain_client.peer_client = peer_client
+            blockchain_client.node_id = node_config.node_id
+            logger.info(f"Peer client attached to blockchain client for epoch broadcasting (Node ID: {node_config.node_id})")
         
         # Set node signer for P2P message authentication
         if monitoring_available:
@@ -329,12 +339,15 @@ async def startup_event():
                         'gas_price_gwei': 20
                     }
                     blockchain_client = BlockchainClient(config=blockchain_config)
-                
-                # Check if blockchain is actually available
+                                # Check if blockchain is actually available
                 if blockchain_client.is_blockchain_available():
                     blockchain_available = True
                     health = blockchain_client.health_check()
                     logger.info(f"✅ Blockchain connected successfully: {health.get('contract', 'N/A')}")
+                    # Attach peer_client to blockchain_client for broadcasting (Phase 3)
+                    blockchain_client.peer_client = peer_client
+                    blockchain_client.node_id = node_config.node_id
+                    logger.info(f"Peer client attached to blockchain client for epoch broadcasting (Node ID: {node_config.node_id})")
                     break
                 else:
                     logger.warning(f"Blockchain not available (attempt {attempt + 1}/{max_retries})")
@@ -357,6 +370,28 @@ async def startup_event():
         try:
             epoch_manager = init_epoch_manager(node_config.node_id, ml_consensus, blockchain_client)
             logger.info("Epoch Manager initialized successfully")
+            
+            # Sharded Consensus Setup: Register P2P handlers and distribute websites
+            if peer_client and epoch_manager:
+                async def handle_shard_results(data, sender_id):
+                    epoch_id = data.get('epoch_id')
+                    shard_id = data.get('shard_id')
+                    results = data.get('results')
+                    if epoch_id and results:
+                        await epoch_manager.add_shard_results(epoch_id, shard_id, results)
+                
+                peer_client.register_message_handler('shard_aggregated_results', handle_shard_results)
+                logger.info("Registered P2P handler for 'shard_aggregated_results'")
+
+            if epoch_manager and epoch_manager.shard_manager:
+                # Force initial website distribution to shards
+                epoch_manager.shard_manager.on_epoch_complete(
+                    epoch_manager.get_current_epoch(), 
+                    ml_consensus, 
+                    all_websites=node_config.websites
+                )
+                logger.info(f"Initial shard distribution complete for {len(node_config.websites)} websites")
+
         except Exception as e:
             logger.error(f"Failed to initialize Epoch Manager: {e}")
             epoch_manager = None
@@ -824,12 +859,21 @@ async def process_monitoring_results():
                     is_reachable=last_result.get('status') == 'success'
                 )
                 
-                logger.info(f"DEBUG: About to broadcast to {len(peer_urls)} peers: {peer_urls}")
-                
-                # Broadcast to all registered peers
+                # DYNAMIC SHARDING: Only share with peers in the same shard
+                target_peers = peer_urls
+                if epoch_manager and epoch_manager.shard_manager:
+                    our_shard = epoch_manager.shard_manager.get_node_shard(node_config.node_id)
+                    if our_shard is not None:
+                        target_peers = [
+                            info["url"] for nid, info in peer_registry.items()
+                            if epoch_manager.shard_manager.get_node_shard(nid) == our_shard
+                        ]
+                        logger.info(f"Intra-shard broadcast: sharing report with {len(target_peers)} peers in shard {our_shard}")
+
+                # Broadcast to filtered peers
                 broadcast_results = await peer_client.broadcast_report(
                     signed_report, 
-                    peer_urls
+                    target_peers
                 )
                 
                 success_count = sum(broadcast_results.values())
@@ -1001,7 +1045,19 @@ async def add_peer(peer: PeerInfo):
         raise HTTPException(status_code=503, detail="Peer client not available")
     
     try:
+        # Add to peer_client for P2P messages
         await peer_client.add_peer(peer.node_id, peer.host, peer.port)
+        
+        # Phase 2: Add to peer_registry for report broadcasting
+        # This is CRITICAL for the demo script where nodes are added via /peers
+        peer_url = f"http://{peer.host}:{peer.port}"
+        if peer.node_id not in peer_registry:
+            peer_registry[peer.node_id] = {
+                "url": peer_url,
+                "public_key_hex": None  # Will be updated if they register or send a signed report
+            }
+            logger.info(f"Added peer {peer.node_id} to broadcast registry: {peer_url}")
+            
         return {"status": "success", "message": f"Peer {peer.node_id} added"}
     except Exception as e:
         logger.error(f"Error adding peer: {e}")
@@ -1387,108 +1443,77 @@ async def get_verdicts():
 
 @app.get("/sharding/status")
 async def get_sharding_status():
-    """Get current sharding status and assignments"""
-    global ml_consensus, peer_registry
-    
-    if not ml_consensus:
-        return {"error": "ML consensus engine not available"}
-    
-    # Get node reputations (including this node)
-    node_reputations = {}
-    if hasattr(ml_consensus, 'reputation'):
-        node_reputations.update(ml_consensus.reputation)
-    
-    # Add this node's reputation
-    if trust_engine:
-        try:
-            our_rep = trust_engine.calculate_por_score(
-                trust_engine.monitoring_trust.get(node_config.node_id, 0.95),
-                0.95  # Default ML score for our node
-            )
-            node_reputations[node_config.node_id] = our_rep
-        except:
-            node_reputations[node_config.node_id] = 0.95
-    
-    # Add peer node reputations (default if not known)
-    for peer_id in peer_registry.keys():
-        if peer_id not in node_reputations:
-            node_reputations[peer_id] = 0.85  # Default for unknown peers
+    """Get current Dynamic Trust-Aware Shard status from DynamicShardManager."""
+    global epoch_manager, ml_consensus
 
-    # Get total active nodes (including ourselves)
-    total_nodes = len(node_reputations)
-    active_nodes = 1 + len(peer_registry)
-    
-    # Calculate number of shards (using spec formula)
-    # Target 3-4 nodes per shard for 8 nodes
-    num_shards = max(1, min(6, total_nodes // 4)) if total_nodes >= 4 else 1
-    
-    # Sort nodes by reputation (high to low)
-    sorted_nodes = sorted(node_reputations.items(), key=lambda x: x[1], reverse=True)
-    
-    # Assign nodes to shards using round-robin on sorted list
-    shards = {}
-    for i, (node_id, reputation) in enumerate(sorted_nodes):
-        shard_id = i % num_shards
-        if shard_id not in shards:
-            shards[shard_id] = []
-        shards[shard_id].append({
-            "node_id": node_id,
-            "reputation": reputation,
-            "tier": "PRIMARY" if reputation >= 0.8 else "MONITORING" if reputation >= 0.5 else "QUARANTINE" if reputation >= 0.2 else "SLASHED"
-        })
-    
-    # Elect leaders (highest reputation in each shard)
-    shard_info = []
-    for shard_id, members in shards.items():
-        leader = max(members, key=lambda x: x["reputation"])
-        avg_reputation = sum(m["reputation"] for m in members) / len(members)
-        
-        shard_info.append({
-            "shard_id": shard_id,
-            "leader": {
-                "node_id": leader["node_id"],
-                "reputation": leader["reputation"],
-                "tier": leader["tier"]
-            },
-            "members": members,
-            "avg_reputation": avg_reputation,
-            "size": len(members),
-            "last_consensus": {
-                "verdict": "UP",
-                "confidence": 0.95,
-                "timestamp": int(time.time())
-            }
-        })
-    
-    return {
-        "total_nodes": total_nodes,
-        "active_nodes": active_nodes,
-        "num_shards": num_shards,
-        "shard_policy": "reputation_sorted",
-        "target_shard_size": "3-4 nodes",
-        "shards": shard_info,
-        "cross_shard_exchange": {
-            "last_exchange": int(time.time()),
-            "participating_leaders": [s["leader"]["node_id"] for s in shard_info],
-            "exchange_latency_ms": 45,
-            "success_rate": 1.0
+    # Try DynamicShardManager first (preferred source)
+    if epoch_manager and epoch_manager.shard_manager is not None:
+        status = epoch_manager.shard_manager.get_shard_status()
+        # Members are already enriched dicts: {node_id, reputation, tier, action}
+        # Optionally refresh reputations from live ML engine
+        if ml_consensus:
+            reps = ml_consensus.ewma_reputations or ml_consensus.reputation or {}
+            for sid, shard in status["shards"].items():
+                for m in shard["members"]:
+                    live_rep = reps.get(m["node_id"])
+                    if live_rep is not None:
+                        m["reputation"] = round(live_rep, 4)
+        return {
+            "source":             "DynamicShardManager",
+            "current_epoch":      status["current_epoch"],
+            "last_reshuffle":     status["last_reshuffle"],
+            "n_shards":           status["n_shards"],
+            "reshuffle_interval": status["reshuffle_interval"],
+            "shards":             status["shards"],
+            "assignment":         status["assignment"],
         }
-    }
+
+    # Fallback: derive numbered shards directly from ML engine reputations
+    if ml_consensus:
+        reps = ml_consensus.ewma_reputations or ml_consensus.reputation or {}
+        try:
+            from src.shard_manager import ReshufflingEngine, LeaderElectionManager
+            eng = ReshufflingEngine()
+            actions = getattr(ml_consensus, "mitigation_actions", {})
+            shards_raw, assignment, n_shards = eng.reshuffle(reps, actions, 0)
+            leaders = LeaderElectionManager().elect_leaders(shards_raw, 0)
+            shards_out = {}
+            for sid, members in shards_raw.items():
+                shards_out[str(sid)] = {
+                    "shard_id": sid,
+                    "leader":   leaders.get(sid),
+                    "count":    len(members),
+                    "members":  members,
+                }
+            return {
+                "source":         "ml_engine_fallback",
+                "n_shards":       n_shards,
+                "shards":         shards_out,
+                "assignment":     {nid: int(sid) for nid, sid in assignment.items()},
+                "current_epoch":  None,
+            }
+        except Exception as e:
+            logger.warning(f"Fallback sharding failed: {e}")
+
+    return {"error": "No sharding data available yet"}
 
 @app.get("/sharding/history")
-async def get_sharding_history():
-    """Get historical shard assignments and changes"""
-    return {
-        "history": [
-            {
-                "epoch_id": int(time.time()) - 60,
-                "num_shards": 2,
-                "total_nodes": len(peer_registry) + 1,
-                "reconfigurations": 0,
-                "avg_shard_size": (len(peer_registry) + 1) // 2
-            }
-        ]
-    }
+async def get_sharding_history(limit: int = 10):
+    """Get the most recent DynamicShardManager reshuffle audit trail."""
+    global epoch_manager
+    if epoch_manager and epoch_manager.shard_manager is not None:
+        history = epoch_manager.shard_manager.get_history(limit=limit)
+        return {"history": history, "total_entries": len(history)}
+    return {"history": [], "total_entries": 0}
+
+
+@app.get("/sharding/stats")
+async def get_sharding_stats():
+    """Get aggregate reshuffle statistics from DynamicShardManager."""
+    global epoch_manager
+    if epoch_manager and epoch_manager.shard_manager is not None:
+        return epoch_manager.shard_manager.get_reshuffle_stats()
+    return {"total_reshuffles": 0}
 
 @app.get("/shard/{shard_id}/members")
 async def get_shard_members(shard_id: int):
@@ -1616,9 +1641,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Generate node ID if not provided
-    node_id = args.node_id or f"node_{args.port}"
+    import os
+    env_port = os.getenv("PORT")
+    actual_port = int(env_port) if env_port else args.port
+    node_id = args.node_id or os.getenv("NODE_ID") or f"node_{actual_port}"
     
-    logger.info(f"Starting node {node_id} on {args.host}:{args.port}")
+    logger.info(f"Starting node {node_id} on {args.host}:{actual_port}")
     logger.info(f"Websites to monitor: {args.websites}")
     if args.peers:
         logger.info(f"Peers: {args.peers}")
@@ -1627,7 +1655,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host=args.host,
-        port=args.port,
+        port=actual_port,
         reload=False,
         log_level="info",
         access_log=False

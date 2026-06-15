@@ -470,18 +470,8 @@ class PeerClient:
         external_peers = [u for u in peer_urls if get_shard_id(u) != our_shard]
         
         # Gossip Fanout Selection:
-        # Pick 2 peers from same shard + 1 peer from a different shard (The "Bridge")
-        selected_urls = []
-        import random
-        
-        if shard_peers:
-            selected_urls.extend(random.sample(shard_peers, min(2, len(shard_peers))))
-        if external_peers:
-            selected_urls.extend(random.sample(external_peers, min(1, len(external_peers))))
-            
-        # Fallback if shards are empty
-        if not selected_urls and peer_urls:
-            selected_urls = random.sample(peer_urls, min(3, len(peer_urls)))
+        # For the demo cluster, we broadcast to ALL peers to ensure perfect consensus convergence and database alignment
+        selected_urls = list(peer_urls)
 
         logger.info(f"Sharded Gossip: shard={our_shard} | local={len(shard_peers)} | ext={len(external_peers)}")
         logger.info(f"Selected Targets: {selected_urls}")
@@ -582,7 +572,7 @@ class PeerClient:
             # Use custom handler if registered
             if message_type in self.message_handlers:
                 await self.message_handlers[message_type](message)
-            else:
+            elif message_type not in self.MESSAGE_TYPES.values():
                 logger.warning(f"Unknown message type: {message_type}")
 
             ttl = message.get('ttl')
@@ -827,8 +817,10 @@ class PeerClient:
     async def _check_single_peer(self, node_id: str, peer: PeerNode) -> Tuple[str, bool]:
         """Check health of a single peer"""
         try:
-            url = f"http://{peer.host}:{peer.port}/peer/info"
-            
+            # Correct port: /peer/info is on the P2P port (API port + 1000)
+            p2p_port = peer.port + 1000
+            url = f"http://{peer.host}:{p2p_port}/peer/info"
+
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=PeerConfig.HEALTH_CHECK_TIMEOUT)) as response:
                 if response.status == 200:
                     peer.is_active = True

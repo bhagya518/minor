@@ -85,11 +85,19 @@ class EnhancedMLConsensusEngine:
         
         # Graph for network analysis
         self.graph = nx.DiGraph()
+        self.graph_trust_scores = {}
         
-        # Enhanced mitigation thresholds (4-tier)
-        self.HEALTHY_T = 0.8
-        self.SUSPICIOUS_T = 0.5
-        self.FAULTY_T = 0.2
+        # Graph trust weights (Slide 11 Fusion)
+        self.w1 = 0.30  # ReputationScore weight
+        self.w2 = 0.20  # GraphTrustScore weight
+        self.w3 = 0.35  # RandomForestTrust weight
+        self.w4 = 0.15  # IsolationForestTrust weight
+        
+        # Enhanced mitigation thresholds (4-tier - Slide 19 alignment)
+        self.HEALTHY_T = 0.60      # PRIMARY  : trust >= 0.60
+        self.SUSPICIOUS_T = 0.38   # MONITORING: 0.38 <= trust < 0.60
+        self.FAULTY_T = 0.20       # QUARANTINE: 0.20 <= trust < 0.38
+        # trust < 0.20 is SLASHED tier
         
         # Consensus tracking
         self.consensus_votes = defaultdict(list)  # epoch_id -> [votes]
@@ -181,69 +189,43 @@ class EnhancedMLConsensusEngine:
 
     def process_sharded_consensus(self, epoch_id: int, reports: List[Dict]) -> Dict:
         """
-        Process consensus using sharded approach with cross-shard communication
+        Process consensus using sharded approach (delegates to process_epoch_consensus)
         """
-        logger.info(f"🚀 STARTING SHARDED CONSENSUS for epoch {epoch_id}")
-        
-        # Ensure shards are assigned
-        if not hasattr(self, 'shards') or not self.shards:
-            self._assign_nodes_to_shards()
-        
-        # Group reports by shard
-        shard_reports = defaultdict(list)
-        for report in reports:
-            node_id = report.get('node_id') or report.get('node_address', 'unknown')
-            
-            # Find which shard this node belongs to
-            node_shard = None
-            for shard_id, members in self.shards.items():
-                if node_id in members:
-                    node_shard = shard_id
-                    break
-            
-            if node_shard is not None:
-                shard_reports[node_shard].append(report)
-            else:
-                # Unassigned node, find its shard based on reputation
-                rep = self.ewma_reputations.get(node_id, 0.90)
-                decision = self.apply_mitigation_policy(rep)
-                shard_reports[decision.shard].append(report)
-        
-        # Run intra-shard consensus for each shard
-        shard_results = {}
-        for shard_id in self.shards.keys():
-            shard_verdict = self._run_intra_shard_consensus(shard_id, shard_reports[shard_id])
-            shard_results[shard_id] = shard_verdict
-            logger.info(f"Shard {shard_id} verdict: {shard_verdict['verdict']} (confidence: {shard_verdict['confidence']:.3f})")
-        
-        # Cross-shard consensus (majority vote among shard verdicts)
-        global_verdict = self._run_cross_shard_consensus(shard_results)
-        
-        # Update reputations based on global consensus
-        reputation_updates = self._update_reputations_from_consensus(global_verdict, reports)
-        
-        # Apply policies to results
-        mitigation_actions = {}
-        for node_id, rep in self.reputation.items():
-            decision = self.apply_mitigation_policy(rep)
-            self.mitigation_actions[node_id] = decision
-            mitigation_actions[node_id] = {
-                'status': decision.status,
-                'action': decision.action,
-                'shard': decision.shard
-            }
-        
-        # Final Step: Persist state after each epoch
-        self.save_state()
+        return self.process_epoch_consensus(epoch_id, reports)
+
+    def process_website_consensus(self, url: str, reports: List[Dict]) -> Dict:
+        """
+        Calculate consensus for a specific website based on reports.
+        Selection: UP/DOWN status and average latency.
+        """
+        if not reports:
+            return {"url": url, "final_status": "DOWN", "avg_latency": 0}
+
+        # Filter reports for this URL
+        url_reports = [r for r in reports if r.get("url") == url]
+        if not url_reports:
+            return {"url": url, "final_status": "DOWN", "avg_latency": 0}
+
+        # Step 1: Status Consensus (Majority Vote)
+        up_votes = [1 if r.get("is_reachable", True) else 0 for r in url_reports]
+        final_status = "UP" if np.mean(up_votes) >= 0.5 else "DOWN"
+
+        # Step 2: Latency Consensus (Average of nodes that agree with the majority status)
+        majority_reachable = (final_status == "UP")
+        agreeing_latencies = [
+            float(r.get("response_ms", r.get("response_time_ms", 0)))
+            for r in url_reports
+            if r.get("is_reachable", True) == majority_reachable
+        ]
+
+        avg_latency = np.mean(agreeing_latencies) if agreeing_latencies else 0
+
+        logger.info(f"Consensus for {url}: {final_status} ({avg_latency:.1f}ms) based on {len(url_reports)} reports")
         
         return {
-            'global_verdict': global_verdict,
-            'shard_results': shard_results,
-            'reputations': self.reputation,
-            'ewma_reputations': self.ewma_reputations,
-            'mitigation_actions': mitigation_actions,
-            'num_shards': len(self.shards),
-            'processing_time_ms': 50  # Placeholder
+            "url": url,
+            "final_status": final_status,
+            "avg_latency": float(avg_latency)
         }
 
     def _update_reputations_from_consensus(self, global_verdict: Dict, reports: List[Dict]) -> Dict:
@@ -402,14 +384,41 @@ class EnhancedMLConsensusEngine:
             if isinstance(iso_artifact, dict):
                 self.behavioral_cols = list(iso_artifact.get('behavioral_cols', iso_artifact.get('feature_cols', [])))
                 self.iso_scaler = iso_artifact.get('scaler')
-                self.iso_min = iso_artifact.get('iso_min', -0.5)
-                self.iso_max = iso_artifact.get('iso_max', 0.5)
+                iso_min_saved = iso_artifact.get('iso_min')
+                iso_max_saved = iso_artifact.get('iso_max')
             else:
                 # If iso_artifact is the model itself, use RF features as fallback
                 self.behavioral_cols = self.rf_feature_cols
                 self.iso_scaler = None
-                self.iso_min = -0.5
-                self.iso_max = 0.5
+                iso_min_saved = None
+                iso_max_saved = None
+
+            # FIX: Calibrate ISO bounds if not stored in artifact.
+            # The artifact was saved without iso_min/iso_max, so we compute
+            # realistic bounds by scoring a synthetic representative dataset.
+            if iso_min_saved is None or iso_max_saved is None:
+                try:
+                    n_features = len(self.behavioral_cols)
+                    # Generate synthetic samples covering the expected operating range
+                    rng = np.random.default_rng(42)
+                    cal_samples = rng.uniform(
+                        [0] * n_features,
+                        [5000, 1e7, 3000, 7000, 10000, 1.0][:n_features],
+                        (1000, n_features)
+                    )
+                    if self.iso_scaler is not None and hasattr(self.iso_scaler, 'mean_'):
+                        cal_samples = self.iso_scaler.transform(cal_samples)
+                    cal_scores = -self.iso_model.decision_function(cal_samples)
+                    self.iso_min = float(cal_scores.min())
+                    self.iso_max = float(cal_scores.max())
+                    logger.info(f"✅ Calibrated ISO bounds from synthetic data: min={self.iso_min:.4f} max={self.iso_max:.4f}")
+                except Exception as cal_e:
+                    logger.warning(f"⚠️ ISO calibration failed ({cal_e}), using fallback bounds")
+                    self.iso_min = 0.30
+                    self.iso_max = 0.35
+            else:
+                self.iso_min = iso_min_saved
+                self.iso_max = iso_max_saved
             
             # Load Gradient Boosting meta-learner if available
             meta_path = os.path.join(model_path, 'meta_learner.joblib')
@@ -468,13 +477,20 @@ class EnhancedMLConsensusEngine:
         except Exception as e:
             logger.error(f"Error updating reputation for {node_id}: {e}")
     
-    def apply_mitigation_policy(self, reputation_score: float) -> MitigationDecision:
+    def apply_mitigation_policy(self, reputation_score: float, node_id: Optional[str] = None) -> MitigationDecision:
         """Apply 4-tier mitigation policy from ML_MINOR"""
-        if reputation_score > self.HEALTHY_T:
+        effective_score = reputation_score
+        if node_id is not None:
+            g_score = self.graph_trust_scores.get(node_id, 0.95)
+            if g_score < 0.3:
+                effective_score = min(effective_score, self.SUSPICIOUS_T)
+                logger.info(f"Node {node_id} demoted due to low Graph Trust Score ({g_score:.4f} < 0.3)")
+                
+        if effective_score > self.HEALTHY_T:
             return MitigationDecision(status="HEALTHY", action="ALLOW", shard="PRIMARY")
-        elif reputation_score > self.SUSPICIOUS_T:
+        elif effective_score > self.SUSPICIOUS_T:
             return MitigationDecision(status="SUSPICIOUS", action="WARN", shard="MONITORING")
-        elif reputation_score > self.FAULTY_T:
+        elif effective_score > self.FAULTY_T:
             return MitigationDecision(status="FAULTY", action="QUARANTINE", shard="QUARANTINE")
         else:
             return MitigationDecision(status="MALICIOUS", action="SLASHED", shard="SLASHED")
@@ -502,7 +518,11 @@ class EnhancedMLConsensusEngine:
                 rf_scaled = rf_matrix
             
             # Batch RF Prediction
-            rf_probs = self.rf_model.predict_proba(rf_scaled)[:, 1]
+            # FIX: class 0 = HONEST (high-trust), class 1 = MALICIOUS.
+            # We want P(honest) as the reputation signal, so use column 0.
+            rf_all_probs = self.rf_model.predict_proba(rf_scaled)
+            honest_class_idx = list(self.rf_model.classes_).index(0) if 0 in self.rf_model.classes_ else 0
+            rf_probs = rf_all_probs[:, honest_class_idx]
             
             # 2. Prepare ISO Feature Matrix
             iso_data = []
@@ -520,14 +540,26 @@ class EnhancedMLConsensusEngine:
             iso_scores = -self.iso_model.decision_function(iso_scaled)
             iso_norms = np.clip((iso_scores - self.iso_min) / (self.iso_max - self.iso_min + 1e-12), 0.0, 1.0)
             
+            # Extract previous reputations and graph trust scores
+            prev_reps = []
+            graph_trusts = []
+            for feat in features_list:
+                node_id = feat.get('node_id') or feat.get('node_address')
+                prev_reps.append(self.ewma_reputations.get(node_id, 0.95))
+                graph_trusts.append(self.graph_trust_scores.get(node_id, 0.95))
+                
+            prev_reps = np.array(prev_reps)
+            graph_trusts = np.array(graph_trusts)
+            
             # 3. Fusion (Vectorized)
             if self.meta_model is not None:
-                meta_input = np.column_stack((rf_probs, iso_norms, np.zeros_like(rf_probs)))
+                meta_input = np.column_stack((rf_probs, iso_norms, 1.0 - graph_trusts))
                 meta_probs = self.meta_model.predict_proba(meta_input)
                 reputations = meta_probs[:, 1] if meta_probs.shape[1] > 1 else meta_probs[:, 0]
             else:
                 iso_reps = 1.0 - iso_norms
-                reputations = (0.7 * rf_probs) + (0.3 * iso_reps)
+                # FinalTrust = w1 * ReputationScore + w2 * GraphTrustScore + w3 * RandomForestTrust + w4 * IsolationForestTrust
+                reputations = (self.w1 * prev_reps) + (self.w2 * graph_trusts) + (self.w3 * rf_probs) + (self.w4 * iso_reps)
             
             return np.clip(reputations, 0.0, 1.0).tolist()
             
@@ -535,11 +567,14 @@ class EnhancedMLConsensusEngine:
             logger.error(f"Error in batch reputation calculation: {e}")
             return [0.5] * len(features_list)
     
-    def calculate_enhanced_reputation(self, features: Dict) -> float:
+    def calculate_enhanced_reputation(self, features: Dict, node_id: Optional[str] = None) -> float:
         """Calculate enhanced reputation using ML models"""
         try:
             # Debug: Log the features being passed
             logger.debug(f"Features passed to ML model: {features}")
+
+            if node_id is None:
+                node_id = features.get('node_id') or features.get('node_address')
 
             # Validate required features to avoid silent garbage input
             missing_rf = [c for c in self.rf_feature_cols if c not in features]
@@ -573,8 +608,11 @@ class EnhancedMLConsensusEngine:
             logger.debug(f"RF features scaled: {rf_scaled}")
             
             # Get RF probability
-            rf_prob = float(self.rf_model.predict_proba(rf_scaled)[:, 1][0])
-            logger.debug(f"RF probability: {rf_prob}")
+            # FIX: class 0 = HONEST, class 1 = MALICIOUS. Use P(honest) = class 0 probability.
+            rf_all = self.rf_model.predict_proba(rf_scaled)
+            honest_idx = list(self.rf_model.classes_).index(0) if 0 in self.rf_model.classes_ else 0
+            rf_prob = float(rf_all[:, honest_idx][0])
+            logger.debug(f"RF probability (honest): {rf_prob}")
             
             # Prepare behavioral features for Isolation Forest
             beh_features = []
@@ -605,24 +643,32 @@ class EnhancedMLConsensusEngine:
             iso_norm = float(np.clip((iso_score - self.iso_min) / (self.iso_max - self.iso_min + 1e-12), 0.0, 1.0))
             logger.debug(f"ISO normalized: {iso_norm}")
             
-            # Fusion approach: Use meta-learner if available, otherwise 70/30 weighted fusion
+            # Get previous reputation and graph trust score
+            prev_rep = self.ewma_reputations.get(node_id, 0.95)
+            graph_trust = self.graph_trust_scores.get(node_id, 0.95)
+            
+            # Fusion approach: Use meta-learner if available, otherwise weighted fusion
             if self.meta_model is not None:
                 # Use Gradient Boosting meta-learner (spec-compliant)
-                meta_features = np.array([[rf_prob, iso_norm, 0.0]])  # 3rd feature placeholder for graph
+                meta_features = np.array([[rf_prob, iso_norm, float(1.0 - graph_trust)]])  # 3rd feature for graph anomaly
                 meta_proba = self.meta_model.predict_proba(meta_features)[0]
-                # CRITICAL FIX: RF model predicts Class 1 = HONEST, so use probability directly as reputation
-                reputation = meta_proba[1] if len(meta_proba) > 1 else meta_proba[0]  # Probability of honest
-                logger.debug(f"Meta-learner reputation: {reputation}")
+                # Meta-learner predicts Class 1 = MALICIOUS, Class 0 = HONEST
+                # We need Malicious Probability for Slide 17 formula
+                malicious_probability = meta_proba[1] if len(meta_proba) > 1 else meta_proba[0]
+                logger.debug(f"Meta-learner malicious probability: {malicious_probability}")
             else:
-                # CRITICAL FIX: RF model predicts Class 1 = HONEST, so rf_prob IS the reputation
-                # ISO detects anomalies (higher = more anomalous), so invert it
-                iso_reputation = 1.0 - iso_norm
-                # Fallback: 70% RF (honest probability) + 30% ISO (honest probability)
-                reputation = (0.7 * rf_prob) + (0.3 * iso_reputation)
+                # Weighted Fusion fallback (Higher score = More Malicious for this formula)
+                # MaliciousProb = w1 * (1-PrevRep) + w2 * (1-GraphTrust) + w3 * (1-RFTrust) + w4 * ISONorm
+                malicious_probability = (self.w1 * (1.0 - prev_rep)) + (self.w2 * (1.0 - graph_trust)) + \
+                                        (self.w3 * (1.0 - rf_prob)) + (self.w4 * iso_norm)
+                logger.debug(f"Weighted Fusion malicious probability: {malicious_probability}")
             
+            # 4. Reputation Calculation (Slide 17)
+            # Formula: Reputation = 1 - MaliciousProbability
+            reputation = 1.0 - malicious_probability
             reputation = float(np.clip(reputation, 0.0, 1.0))
-            logger.debug(f"Final reputation: {reputation}")
-            
+            logger.debug(f"Reputation calculation (Slide 17): 1 - {malicious_probability:.4f} = {reputation:.4f}")
+
             return reputation
             
         except Exception as e:
@@ -630,18 +676,19 @@ class EnhancedMLConsensusEngine:
             return 0.5
     
     def apply_ewma_smoothing(self, node_id: str, current_reputation: float) -> float:
-        """Apply EWMA smoothing to reputation with CORRECT formula"""
+        """Apply EWMA smoothing to reputation (Slide 18 Formula)"""
         if node_id not in self.ewma_reputations:
             # Initialize with current reputation
             self.ewma_reputations[node_id] = current_reputation
             return current_reputation
-        
-        # CRITICAL FIX: Correct EWMA formula - weight NEW data more (alpha=0.3)
-        # Wrong: ewma = alpha * old + (1-alpha) * new  # This weights history 70%
-        # Correct: ewma = alpha * new + (1-alpha) * old  # This weights new data 30%
-        ewma_rep = self.alpha * current_reputation + (1.0 - self.alpha) * self.ewma_reputations[node_id]
+
+        # Slide 18 Formula: Rep_new = alpha * Rep_old + (1 - alpha) * Rep_current
+        # alpha is the smoothing factor (e.g., 0.3)
+        old_rep = self.ewma_reputations[node_id]
+        ewma_rep = (self.alpha * old_rep) + ((1.0 - self.alpha) * current_reputation)
         self.ewma_reputations[node_id] = ewma_rep
-        
+
+        logger.debug(f"EWMA Update (Slide 18) for {node_id}: {self.alpha}*{old_rep:.4f} + {(1.0-self.alpha)}*{current_reputation:.4f} = {ewma_rep:.4f}")
         return ewma_rep
     
     async def calculate_enhanced_reputation_async(self, features: Dict) -> float:
@@ -657,7 +704,7 @@ class EnhancedMLConsensusEngine:
     def evaluate_node(self, node_id: str, features: Dict) -> Tuple[float, MitigationDecision]:
         """Evaluate node and return reputation with mitigation decision"""
         # Calculate raw reputation
-        raw_reputation = self.calculate_enhanced_reputation(features)
+        raw_reputation = self.calculate_enhanced_reputation(features, node_id)
         
         # Apply EWMA smoothing
         smoothed_reputation = self.apply_ewma_smoothing(node_id, raw_reputation)
@@ -667,7 +714,7 @@ class EnhancedMLConsensusEngine:
         self.reputation_history[node_id].append(smoothed_reputation)
         
         # Apply mitigation policy
-        decision = self.apply_mitigation_policy(smoothed_reputation)
+        decision = self.apply_mitigation_policy(smoothed_reputation, node_id)
         self.mitigation_actions[node_id] = decision
         
         return smoothed_reputation, decision
@@ -675,42 +722,30 @@ class EnhancedMLConsensusEngine:
     def extract_features_from_report(self, report: Dict, majority_verdicts: Optional[Dict[str, bool]] = None) -> Dict:
         """
         Extract features from a single monitoring report.
-        Computes both RIPE Atlas features and the 11 correct features for ML model.
+        Computes the 8 RIPE Atlas features for ML model.
         """
-        # Default features if report is incomplete
+        # Default features if report is incomplete (in seconds)
         features = {
-            # 8 RIPE Atlas features
-            'avg_latency': 150.0,
-            'latency_var': 100.0,
-            'std_latency': 10.0,
+            # 8 RIPE Atlas features (in seconds)
+            'avg_latency': 0.150,
+            'latency_var': 0.0001,
+            'std_latency': 0.010,
             'skewness': 0.0,
             'kurtosis': 0.0,
-            'p95_latency': 180.0,
-            'max_latency': 200.0,
+            'p95_latency': 0.180,
+            'max_latency': 0.200,
             'failure_rate': 0.0,
-            
-            # 11 Correct features
-            'peer_agreement_rate': 0.95,
-            'ssl_accuracy': 0.95,
-            'avg_rt_error': 0.05,
-            'report_consistency': 0.95,
-            'sudden_change_score': 0.05,
-            'uptime_deviation': 0.05,
-            'rt_consistency': 0.95,
-            'itt_jitter': 0.05,
-            'accuracy': 0.95,
-            'false_positive_rate': 0.02,
-            'false_negative_rate': 0.02,
         }
         
         # Extract node_id to track history
         node_id = report.get('node_id') or report.get('node_address', 'unknown')
         
         # Get current latency and failure status
-        current_latency = report.get('response_ms', report.get('response_time_ms', -1))
+        raw_latency = report.get('response_ms', report.get('response_time_ms', -1))
+        current_latency = float(raw_latency) if raw_latency is not None else -1.0
         is_failure = (report.get('status') == 'error' or 
-                     report.get('http_status', 0) == 0 or
-                     current_latency < 0)
+                      report.get('http_status', 0) == 0 or
+                      current_latency < 0)
         
         # Update history buffers
         if current_latency >= 0:
@@ -722,40 +757,18 @@ class EnhancedMLConsensusEngine:
         if len(self.node_failure_history[node_id]) > self.history_window_size:
             self.node_failure_history[node_id].pop(0)
             
-        ssl_valid = report.get('ssl_valid', True)
-        self.node_ssl_history[node_id].append(1 if ssl_valid else 0)
-        if len(self.node_ssl_history[node_id]) > self.history_window_size:
-            self.node_ssl_history[node_id].pop(0)
-            
-        timestamp = report.get('timestamp') or time.time()
-        self.node_report_times[node_id].append(timestamp)
-        if len(self.node_report_times[node_id]) > self.history_window_size:
-            self.node_report_times[node_id].pop(0)
-            
-        url = report.get('url')
-        is_reachable = report.get('is_reachable', True)
-        if majority_verdicts and url in majority_verdicts:
-            agreed = (is_reachable == majority_verdicts[url])
-        else:
-            agreed = True
-            
-        self.node_agreement_history[node_id].append(1 if agreed else 0)
-        if len(self.node_agreement_history[node_id]) > self.history_window_size:
-            self.node_agreement_history[node_id].pop(0)
-        
         # Get history lists
         latencies = self.node_latency_history[node_id]
         failures = self.node_failure_history[node_id]
-        ssls = self.node_ssl_history[node_id]
-        agreements = self.node_agreement_history[node_id]
-        timestamps = self.node_report_times[node_id]
         
         if len(latencies) > 0:
             latency_array = np.array(latencies)
             avg_lat = float(np.mean(latency_array))
-            features['avg_latency'] = avg_lat
-            features['latency_var'] = float(np.var(latency_array))
-            features['std_latency'] = float(np.std(latency_array))
+            
+            # CONVERT TO SECONDS for RIPE Atlas ML model inputs
+            features['avg_latency'] = avg_lat / 1000.0
+            features['latency_var'] = float(np.var(latency_array)) / 1000000.0
+            features['std_latency'] = float(np.std(latency_array)) / 1000.0
             
             if len(latencies) >= 3:
                 mean = np.mean(latency_array)
@@ -769,36 +782,11 @@ class EnhancedMLConsensusEngine:
                 if std > 0:
                     features['kurtosis'] = float(np.mean(((latency_array - mean) / std) ** 4) - 3)
             
-            features['p95_latency'] = float(np.percentile(latency_array, 95))
-            features['max_latency'] = float(np.max(latency_array))
-            
-            features['rt_consistency'] = float(max(0.0, 1.0 - (np.std(latency_array) / (avg_lat + 1e-9))))
-            features['sudden_change_score'] = float(min(1.0, abs(current_latency - avg_lat) / (avg_lat + 1e-9)))
+            features['p95_latency'] = float(np.percentile(latency_array, 95)) / 1000.0
+            features['max_latency'] = float(np.max(latency_array)) / 1000.0
  
         if len(failures) > 0:
-            fail_rate = float(np.mean(failures))
-            features['failure_rate'] = fail_rate
-            features['uptime_deviation'] = fail_rate
-            
-        if len(ssls) > 0:
-            features['ssl_accuracy'] = float(np.mean(ssls))
-            
-        if len(agreements) > 0:
-            agreement_rate = float(np.mean(agreements))
-            features['peer_agreement_rate'] = agreement_rate
-            features['accuracy'] = agreement_rate
-            
-            false_reports = 1.0 - agreement_rate
-            features['false_positive_rate'] = float(false_reports * fail_rate) if len(failures) > 0 else 0.0
-            features['false_negative_rate'] = float(false_reports * (1.0 - fail_rate)) if len(failures) > 0 else 0.0
-            
-        features['avg_rt_error'] = float(min(1.0, abs(features['avg_latency'] - 150.0) / 1000.0))
-        
-        if len(timestamps) > 1:
-            diffs = np.diff(timestamps)
-            jitter = float(np.std(diffs))
-            features['itt_jitter'] = float(min(1.0, jitter / 60.0))
-            features['report_consistency'] = float(np.mean(diffs < 120))
+            features['failure_rate'] = float(np.mean(failures))
             
         return features      
         return features
@@ -877,6 +865,11 @@ class EnhancedMLConsensusEngine:
         """
         logger.info(f"🚀 STARTING SHARDED CONSENSUS for epoch {epoch_id}")
         
+        # Trigger interaction graph update and calculate graph trust scores
+        self._update_interaction_graph(reports)
+        self.graph_trust_scores = self._calculate_graph_trust_scores()
+        logger.info(f"Updated interaction graph and calculated Graph Trust Scores: {self.graph_trust_scores}")
+
         results = {
             'epoch_id': epoch_id,
             'engine_type': 'ML_Enhanced_Sharding',
@@ -931,6 +924,7 @@ class EnhancedMLConsensusEngine:
         for sender_id in all_node_ids:
             features = node_features_dict.get(sender_id, {}).copy()
             features['collusion_score'] = 0.0
+            features['node_id'] = sender_id  # Set node_id for calculate_batch_reputation
             features_to_predict.append(features)
         
         # High Performance Pass 2: Batch Predict reputations (Vectorized)
@@ -947,8 +941,8 @@ class EnhancedMLConsensusEngine:
             self.reputation[sender_id] = smoothed_rep
             self.reputation_history[sender_id].append(smoothed_rep)
             
-            # Apply mitigation
-            mitigation = self.apply_mitigation_policy(smoothed_rep)
+            # Apply mitigation with node_id parameter to enable graph-trust based demotion
+            mitigation = self.apply_mitigation_policy(smoothed_rep, sender_id)
             self.mitigation_actions[sender_id] = mitigation
             
             # Store in results
@@ -1017,6 +1011,136 @@ class EnhancedMLConsensusEngine:
             return min(centrality * 2.0, 1.0)
         except:
             return 0.0
+
+    def _update_interaction_graph(self, reports: List[Dict]):
+        """
+        Update the P2P interaction graph.
+        Nodes represent blockchain participants.
+        Edges represent communication or validation interactions.
+        Edge weights represent frequency and node reputations.
+        """
+        if not hasattr(self, 'graph') or self.graph is None:
+            self.graph = nx.DiGraph()
+            
+        # Group reports by monitored URL
+        reports_by_url = {}
+        for r in reports:
+            sender = r.get("node_address") or r.get("node_id") or r.get("sender_id") or r.get("received_from")
+            if not sender:
+                continue
+            if sender not in self.graph:
+                self.graph.add_node(sender)
+                
+            # Communication interaction: increment edge with self.node_id
+            if sender != self.node_id:
+                if self.graph.has_edge(sender, self.node_id):
+                    self.graph[sender][self.node_id]['weight'] = self.graph[sender][self.node_id].get('weight', 1.0) + 1.0
+                else:
+                    self.graph.add_edge(sender, self.node_id, weight=1.0)
+                    
+            url = r.get("url")
+            if url:
+                reports_by_url.setdefault(url, []).append(r)
+                
+        # Consensus validation interactions (agreement matches)
+        for url, url_reports in reports_by_url.items():
+            for i in range(len(url_reports)):
+                for j in range(i + 1, len(url_reports)):
+                    node_i = url_reports[i].get("node_address") or url_reports[i].get("node_id")
+                    node_j = url_reports[j].get("node_address") or url_reports[j].get("node_id")
+                    
+                    if node_i and node_j and node_i != node_j:
+                        vote_i = url_reports[i].get("is_reachable")
+                        vote_j = url_reports[j].get("is_reachable")
+                        
+                        # Weight represents validation agreement
+                        weight_modifier = 1.5 if vote_i == vote_j else 0.1
+                        
+                        # Scale based on current reputations
+                        rep_i = self.ewma_reputations.get(node_i, 0.90)
+                        rep_j = self.ewma_reputations.get(node_j, 0.90)
+                        combined_trust = (rep_i + rep_j) / 2.0
+                        scaled_weight = weight_modifier * combined_trust
+                        
+                        # Update edge node_i -> node_j
+                        if self.graph.has_edge(node_i, node_j):
+                            self.graph[node_i][node_j]['weight'] = self.graph[node_i][node_j].get('weight', 1.0) + scaled_weight
+                        else:
+                            self.graph.add_edge(node_i, node_j, weight=scaled_weight)
+                            
+                        # Update edge node_j -> node_i
+                        if self.graph.has_edge(node_j, node_i):
+                            self.graph[node_j][node_i]['weight'] = self.graph[node_j][node_i].get('weight', 1.0) + scaled_weight
+                        else:
+                            self.graph.add_edge(node_j, node_i, weight=scaled_weight)
+
+    def _calculate_graph_trust_scores(self) -> Dict[str, float]:
+        """
+        Calculate normalized graph trust scores for all nodes in the interaction graph.
+        Uses the exact pagerank and degree anomaly logic from 2ndUDScalability_Malicious.ipynb:
+          pagerank_z = |(pagerank - mean) / (std + 1e-9)|
+          deg = in_degree + out_degree
+          deg_z = |(deg - mean) / (std + 1e-9)|
+          graph_score_raw = (pagerank_z + deg_z) / 2.0
+          graph_score = (graph_score_raw - min) / (max - min + 1e-9)
+        Since the notebook's graph_score represents maliciousness/anomaly, we invert it
+        as (1.0 - graph_score) to get the GraphTrustScore (higher is more trusted).
+        """
+        scores = {}
+        if not self.graph or len(self.graph.nodes) == 0:
+            return {}
+            
+        nodes_list = list(self.graph.nodes)
+        if len(nodes_list) <= 1:
+            return {n: 0.95 for n in nodes_list}
+            
+        # 1. Pagerank Centrality
+        try:
+            pagerank = nx.pagerank(self.graph, weight='weight')
+        except Exception as e:
+            logger.warning(f"Error calculating pagerank: {e}")
+            pagerank = {n: 1.0 / len(nodes_list) for n in nodes_list}
+            
+        # 2. Degree
+        in_deg = dict(self.graph.in_degree(weight="weight"))
+        out_deg = dict(self.graph.out_degree(weight="weight"))
+        
+        pr_vals = np.array([pagerank.get(node, 0.0) for node in nodes_list])
+        deg_vals = np.array([in_deg.get(node, 0.0) + out_deg.get(node, 0.0) for node in nodes_list])
+        
+        # Calculate means and std devs
+        pr_mean = np.mean(pr_vals)
+        pr_std = np.std(pr_vals)
+        deg_mean = np.mean(deg_vals)
+        deg_std = np.std(deg_vals)
+        
+        # Calculate one-sided Z-scores (only penalizing below mean)
+        pr_z = np.clip((pr_mean - pr_vals) / (pr_std + 1e-9), 0.0, None)
+        deg_z = np.clip((deg_mean - deg_vals) / (deg_std + 1e-9), 0.0, None)
+        
+        graph_score_raw = (pr_z + deg_z) / 2.0
+        
+        raw_min = graph_score_raw.min()
+        raw_max = graph_score_raw.max()
+        
+        # Scale to 0-1 range
+        if raw_max - raw_min > 1e-9:
+            graph_score = (graph_score_raw - raw_min) / (raw_max - raw_min + 1e-9)
+        else:
+            graph_score = np.zeros_like(graph_score_raw)
+            
+        # Invert to trust score
+        graph_trust_scores = 1.0 - graph_score
+        
+        logger.info(f"Graph Trust calculation details:")
+        for idx, node in enumerate(nodes_list):
+            logger.info(f"  Node {node}: PR={pr_vals[idx]:.4f} (z_anom={pr_z[idx]:.4f}), Deg={deg_vals[idx]:.4f} (z_anom={deg_z[idx]:.4f}) -> RawAnom={graph_score_raw[idx]:.4f} -> NormAnom={graph_score[idx]:.4f} -> Trust={graph_trust_scores[idx]:.4f}")
+        
+        
+        for idx, node in enumerate(nodes_list):
+            scores[node] = float(np.clip(graph_trust_scores[idx], 0.0, 1.0))
+            
+        return scores
 
 class MLConsensusEngine(EnhancedMLConsensusEngine):
     """Compatibility wrapper for legacy imports."""

@@ -92,13 +92,14 @@ async function main() {
 
   const epochId = Math.floor(Date.now() / 1000);
   await (await proofOfReputation.submitAggregatedReport(
+    nodeId,
     "https://example.com",
     epochId,
     true,
-    3,
-    1,
-    3000,
-    [nodeId]
+    3000, // avgLatency
+    0,    // failureRate
+    0,    // anomalyProb
+    900   // repScore
   )).wait();
   console.log("Aggregated report submitted");
 

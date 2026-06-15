@@ -204,10 +204,10 @@ class EnsembleDetector:
         # Extract graph features
         df_with_graph = self._extract_graph_features(df, node_col)
         
-        # Define feature columns
-        feature_cols = ['avg_response_ms', 'ssl_valid_rate', 'content_match_rate',
-                       'stale_report_rate', 'false_report_rate', 'in_degree',
-                       'out_degree', 'pagerank', 'clustering']
+        # Define feature columns - Aligned with RIPE 8 features + Graph features
+        feature_cols = ['avg_latency', 'latency_var', 'std_latency', 'skewness', 
+                       'kurtosis', 'p95_latency', 'max_latency', 'failure_rate',
+                       'in_degree', 'out_degree', 'pagerank', 'clustering']
         
         # Prepare features
         X = df_with_graph[feature_cols].fillna(0).values
@@ -302,10 +302,10 @@ class EnsembleDetector:
         # Extract graph features
         df_with_graph = self._extract_graph_features(df, node_col)
         
-        # Prepare features
-        feature_cols = ['avg_response_ms', 'ssl_valid_rate', 'content_match_rate',
-                       'stale_report_rate', 'false_report_rate', 'in_degree',
-                       'out_degree', 'pagerank', 'clustering']
+        # Prepare features - Aligned with RIPE 8 features + Graph features
+        feature_cols = ['avg_latency', 'latency_var', 'std_latency', 'skewness', 
+                       'kurtosis', 'p95_latency', 'max_latency', 'failure_rate',
+                       'in_degree', 'out_degree', 'pagerank', 'clustering']
         
         X = df_with_graph[feature_cols].fillna(0).values
         X_scaled = self.scaler.transform(X)

@@ -195,7 +195,7 @@ class WebsiteMonitor:
             if results['http_status'] and 200 <= results['http_status'] < 400:
                 results['status'] = 'success'
             
-            # MALICIOUS NODE BEHAVIOR: Generate false reports
+            # MALICIOUS NODE BEHAVIOR: Generate false reports (always lies)
             if is_malicious and results['status'] == 'success':
                 # Force failure/anomaly for simulation speed
                 malicious_type = random.choice(['down', 'slow', 'ssl_invalid'])
@@ -216,7 +216,32 @@ class WebsiteMonitor:
                     results['ssl_valid'] = False
                     results['status'] = 'success'
                     logger.warning(f"[MALICIOUS NODE] Reporting SSL invalid for {url}")
-            
+
+            # FAULTY NODE BEHAVIOR: Intermittent failures ~50% of the time
+            elif NODE_MODE == 'faulty':
+                if random.random() < 0.5:  # 50% chance of fault
+                    fault_type = random.choice(['down', 'slow', 'slow'])
+                    if fault_type == 'down':
+                        results['http_status'] = 0
+                        results['status'] = 'error'
+                        results['error'] = 'Faulty: intermittent failure'
+                        logger.warning(f"[FAULTY NODE] Reporting {url} as DOWN (intermittent)")
+                    else:
+                        results['response_time_ms'] = random.uniform(5000, 12000)
+                        logger.warning(f"[FAULTY NODE] Reporting high latency for {url}")
+
+            # SUSPICIOUS NODE BEHAVIOR: Subtle anomalies ~25% of the time
+            elif NODE_MODE == 'suspicious':
+                if random.random() < 0.25:  # 25% chance of subtle anomaly
+                    anomaly_type = random.choice(['slow', 'ssl_invalid'])
+                    if anomaly_type == 'slow':
+                        results['response_time_ms'] = random.uniform(3000, 7000)
+                        logger.warning(f"[SUSPICIOUS NODE] Slightly inflated latency for {url}")
+                    elif anomaly_type == 'ssl_invalid':
+                        results['ssl_valid'] = False
+                        logger.warning(f"[SUSPICIOUS NODE] Occasional fake SSL failure for {url}")
+
+
             logger.info(f"Monitoring completed for {url}: {results['status']} (mode: {NODE_MODE})")
             
             # Return dict (not MonitoringReport dataclass)
@@ -571,10 +596,39 @@ class MonitoringScheduler:
         self.running = True
         logger.info(f"Starting periodic monitoring every {self.interval} seconds")
         
+        # Try to import shard manager for dynamic allocation
+        shard_manager = None
+        try:
+            from .shard_manager import get_shard_manager
+            shard_manager = get_shard_manager()
+        except:
+            try:
+                from shard_manager import get_shard_manager
+                shard_manager = get_shard_manager()
+            except:
+                logger.warning("ShardManager not available in MonitoringScheduler")
+
         while self.running:
             try:
-                # Monitor all websites
-                results = await self.monitor.monitor_multiple_websites(self.websites)
+                # DYNAMIC WEBSITE ALLOCATION (Slide 20)
+                # Check shard assignment to see which websites to monitor
+                target_websites = self.websites
+                if shard_manager:
+                    # Look up node_id (global in this module)
+                    from .website_monitor import MY_NODE_ID
+                    shard_idx = shard_manager.get_node_shard(MY_NODE_ID)
+                    if shard_idx is not None:
+                        shard_sites = shard_manager.get_shard_websites(shard_idx)
+                        if shard_sites:
+                            target_websites = shard_sites
+                            logger.info(f"Node {MY_NODE_ID} monitoring {len(target_websites)} websites assigned to Shard {shard_idx}")
+                        else:
+                            logger.info(f"No websites assigned to Shard {shard_idx} yet, monitoring all")
+                    else:
+                        logger.info(f"Node {MY_NODE_ID} not assigned to any shard yet, monitoring all")
+                
+                # Monitor assigned websites
+                results = await self.monitor.monitor_multiple_websites(target_websites)
                 
                 # Store results
                 self.results_history.extend(results)

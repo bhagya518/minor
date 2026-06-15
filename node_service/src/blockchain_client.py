@@ -58,7 +58,7 @@ class BlockchainClient:
             # Strip whitespace
             'contract_address': (os.getenv('CONTRACT_ADDRESS') or '').strip(),
             'chain_id': int(os.getenv('CHAIN_ID', '31337')),
-            'gas_limit': int(os.getenv('GAS_LIMIT', '200000')),
+            'gas_limit': int(os.getenv('GAS_LIMIT', '3000000')),
             'gas_price_gwei': int(os.getenv('GAS_PRICE_GWEI', '20'))
         }
         # Normalize hex strings (add 0x prefix if missing)
@@ -493,6 +493,27 @@ class BlockchainClient:
             
             if result['success']:
                 logger.info(f"Epoch {epoch_id} decision committed to blockchain")
+                
+                # PHASE 3: Broadcast decision to peers if peer_client is attached
+                # This ensures followers sync their local state immediately
+                if hasattr(self, 'peer_client') and self.peer_client:
+                    try:
+                        broadcast_data = {
+                            'epoch_id': epoch_id,
+                            'node_ids': node_ids,
+                            'verdicts': verdicts,
+                            'reputations': reputations,
+                            'timestamp': time.time()
+                        }
+                        # We use a non-blocking way to broadcast if possible, or just await it
+                        import asyncio
+                        asyncio.create_task(self.peer_client.broadcast_message(
+                            'epoch_decision',
+                            broadcast_data
+                        ))
+                        logger.info(f"Epoch {epoch_id} decision broadcasted to network via P2P")
+                    except Exception as e:
+                        logger.warning(f"Failed to broadcast epoch decision: {e}")
             
             return result
                 
@@ -612,46 +633,96 @@ class BlockchainClient:
                 'error': str(e)
             }
     
-    def submit_aggregated_report(self, url: str, epoch_id: int, consensus_result: bool, 
-                               honest_votes: int, malicious_votes: int, total_weight: int,
-                               participating_nodes: List[str]) -> Dict:
+    async def submit_consolidated_reports(self, epoch_id: int, reports: List[Dict], shard_id: int = 1) -> Dict:
         """
-        Submit an aggregated consensus report for an epoch
-        
-        Args:
-            url: The monitored URL
-            epoch_id: Epoch identifier
-            consensus_result: Consensus outcome (True=UP, False=DOWN)
-            honest_votes: Number of honest votes
-            malicious_votes: Number of malicious votes
-            total_weight: Total reputation weight of participants
-            participating_nodes: List of node IDs that participated
-            
-        Returns:
-            Transaction result
+        Submit consolidated monitoring results for an epoch in a single batch.
+        Complies with Slide 23 block body structure.
         """
         try:
-            logger.info(f"Submitting aggregated report for {url}, epoch {epoch_id}")
+            logger.info(f"Submitting {len(reports)} consolidated reports for epoch {epoch_id} (Shard {shard_id})")
             
-            # Call submitAggregatedReport function
+            # Prepare data for Slide 23 compliant batchSubmitAggregatedReports
+            node_ids = [r.get('node_id', self.account.address) for r in reports]
+            urls = [r['url'] for r in reports]
+            epoch_ids = [int(r['epoch']) for r in reports]
+            statuses = [bool(r['status']) for r in reports]
+            latencies = [int(r['latency']) for r in reports]
+            failure_rates = [int(r.get('failure_rate', 0)) for r in reports]
+            anomaly_probs = [int(r.get('anomaly_prob', 0)) for r in reports]
+            rep_scores = [int(r.get('reputation', 500)) for r in reports]
+            
+            # Check if contract has batchSubmitAggregatedReports
+            if hasattr(self.contract.functions, 'batchSubmitAggregatedReports'):
+                function_call = self.contract.functions.batchSubmitAggregatedReports(
+                    node_ids,
+                    urls,
+                    epoch_ids,
+                    statuses,
+                    latencies,
+                    failure_rates,
+                    anomaly_probs,
+                    rep_scores,
+                    int(shard_id)
+                )
+                result = self._send_transaction(function_call)
+                return result
+            else:
+                # Fallback to individual submissions if batch not available
+                results = []
+                for r in reports:
+                    res = self.submit_aggregated_report(
+                        node_id=r.get('node_id', self.account.address),
+                        url=r['url'],
+                        epoch_id=int(r['epoch']),
+                        status=bool(r['status']),
+                        avg_latency=int(r['latency']),
+                        failure_rate=int(r.get('failure_rate', 0)),
+                        anomaly_prob=int(r.get('anomaly_prob', 0)),
+                        rep_score=int(r.get('reputation', 500))
+                    )
+                    results.append(res)
+                
+                success_count = sum(1 for res in results if res.get('success'))
+                return {
+                    'success': success_count > 0,
+                    'total': len(reports),
+                    'successful': success_count,
+                    'results': results
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to submit consolidated reports: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def submit_aggregated_report(self, node_id: str, url: str, epoch_id: int, status: bool,
+                                 avg_latency: int, failure_rate: int, anomaly_prob: int,
+                                 rep_score: int) -> Dict:
+        """
+        Submit an aggregated consensus report for an epoch (Slide 23 compliant)
+        """
+        try:
+            logger.info(f"Submitting Slide 23 compliant report for {url}, epoch {epoch_id}")
+
+            # Call submitAggregatedReport function with new parameters
             function_call = self.contract.functions.submitAggregatedReport(
+                node_id,
                 url,
                 epoch_id,
-                consensus_result,
-                honest_votes,
-                malicious_votes,
-                total_weight,
-                participating_nodes
+                status,
+                avg_latency,
+                failure_rate,
+                anomaly_prob,
+                rep_score
             )
             result = self._send_transaction(function_call)
-            
+
             if result['success']:
-                logger.info(f"Aggregated report submitted for {url}")
-            
+                logger.info(f"✅ Slide 23 report submitted for {url}")
+
             return result
-            
+
         except Exception as e:
-            logger.error(f"Failed to submit aggregated report: {e}")
+            logger.error(f"❌ Failed to submit aggregated report: {e}")
             return {
                 'success': False,
                 'error': str(e)
