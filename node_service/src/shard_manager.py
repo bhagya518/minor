@@ -109,11 +109,11 @@ class LeaderElectionManager:
         """
         Return {shard_index: leader_node_id}.
         Each shard member is a dict with keys 'node_id', 'reputation', 'tier'.
-        Phase 14: Weighted Random Sampling
-        Pi = Rep_i / sum(Rep_j)
+        Binary/Equal Weight Random Sampling:
+        Pi = 1 / N
         """
         leaders: Dict[int, Optional[str]] = {}
-        # Set seed for deterministic weighted sampling per epoch
+        # Set seed for deterministic sampling per epoch
         random.seed(epoch_id * 1337)
         
         for sid, members in shards.items():
@@ -121,16 +121,13 @@ class LeaderElectionManager:
                 leaders[sid] = None
                 continue
             
-            # Step 1: Extract reputations as weights
+            # Step 1: Extract node IDs
             node_ids = [m["node_id"] for m in members]
-            reputations = [max(0.0001, m["reputation"]) for m in members] # Prevent zero weights
             
-            # Step 2: Weighted Random Selection (Phase 14)
-            # Pi = Rep_i / sum(Rep_j)
-            chosen_list = random.choices(node_ids, weights=reputations, k=1)
-            leaders[sid] = chosen_list[0]
+            # Step 2: Simple Random Selection (Equal Weight)
+            leaders[sid] = random.choice(node_ids)
             
-            logger.info(f"Phase 14: Shard {sid} leader elected via weighted random sampling: {leaders[sid]}")
+            logger.info(f"Shard {sid} leader elected via binary random choice: {leaders[sid]}")
             
         return leaders
 
@@ -159,24 +156,24 @@ class ReshufflingEngine:
     def reshuffle(
         self,
         reputations: Dict[str, float],
-        mitigation_actions: Optional[Dict],   # node_id → MitigationDecision or dict
+        mitigation_actions: Optional[Dict],
         epoch_id: int,
     ) -> Tuple[Dict[int, List[Dict]], Dict[str, int], int]:
         """
-        Compute a new Slide 19 compliant shard assignment.
-        1. Sort nodes by reputation.
-        2. Round Robin allocation to shards.
+        Sharding based on Round Robin after sorting by reputation.
+        1. Sort nodes by reputation (descending).
+        2. Assign to shards using Round Robin.
         """
         n_nodes = len(reputations)
         if n_nodes == 0:
             return {}, {}, 0
 
         k = self._compute_shard_count(n_nodes)
-
-        # Step 1 – Sort nodes according to reputation (Slide 19)
+        
+        # Step 1: Sort nodes by reputation (descending)
         sorted_nodes = sorted(reputations.items(), key=lambda x: x[1], reverse=True)
 
-        # Step 2 – Round Robin Allocation (Slide 19)
+        # Step 2: Round Robin Allocation
         shards: Dict[int, List[Dict]] = {i: [] for i in range(k)}
         for i, (nid, rep) in enumerate(sorted_nodes):
             shard_idx = i % k
@@ -197,6 +194,12 @@ class ReshufflingEngine:
                 "tier":       tier,
                 "action":     action,
             })
+
+        # Step 3 – Reverse assignment map
+        assignment: Dict[str, int] = {}
+        for sid, members in shards.items():
+            for m in members:
+                assignment[m["node_id"]] = sid
 
         # Step 3 – Reverse assignment map
         assignment: Dict[str, int] = {}

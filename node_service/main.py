@@ -373,7 +373,9 @@ async def startup_event():
             
             # Sharded Consensus Setup: Register P2P handlers and distribute websites
             if peer_client and epoch_manager:
-                async def handle_shard_results(data, sender_id):
+                async def handle_shard_results(message):
+                    data = message.get('data', {})
+                    sender_id = message.get('sender_id')
                     epoch_id = data.get('epoch_id')
                     shard_id = data.get('shard_id')
                     results = data.get('results')
@@ -635,8 +637,8 @@ async def run_consensus_and_slash():
             "honest":          honest,
             "slashed":         slashed,
             "node_reputations": node_weights,
-            "weighted_malicious": epoch_decision.get("weighted_malicious", 0.0),
-            "weighted_honest":    epoch_decision.get("weighted_honest", 0.0),
+            "total_malicious_votes": epoch_decision.get("malicious_votes", 0),
+            "total_honest_votes":    epoch_decision.get("honest_votes", 0),
         }
         
         logger.info(f"Consensus completed for epoch {epoch_id}")
@@ -646,59 +648,77 @@ async def run_consensus_and_slash():
 
 def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
     """
-    ML-enhanced consensus voting using the ML consensus engine.
-    Reputation scores are calculated using ML models instead of simple majority voting.
+    Binary voting consensus (Simple Majority).
+    
+    Consensus Rule: Majority of reports (N/2 + 1)
+    
+    All nodes have equal voting weight (1.0).
     """
     if not epoch_reports:
         return {}
 
-    # Tally votes: is the site reachable?
-    votes = [r.get("is_reachable", True) for r in epoch_reports]
-    majority_reachable = sum(votes) > len(votes) / 2
-    majority_verdict = "up" if majority_reachable else "down"
+    # Step 1: Calculate binary votes for each node
+    votes = {"up": 0, "down": 0}
+    node_data = {}
+    
+    for report in epoch_reports:
+        node_id = report.get("node_address", report.get("node_id", "unknown"))
+        is_reachable = report.get("is_reachable", True)
+        
+        # Still calculate P_malicious for reputation updates, but NOT for voting weight
+        if ml_consensus and ml_consensus.models_loaded:
+            features = ml_consensus.extract_features_from_report(report)
+            ml_rep = ml_consensus.calculate_enhanced_reputation(features, node_id=node_id)
+            p_malicious = 1.0 - safe_float(ml_rep)
+        else:
+            p_malicious = 0.5 if not is_reachable else 0.1
+            features = {}
+        
+        node_data[node_id] = {
+            "p_malicious": p_malicious,
+            "weight": 1.0, # Binary voting: all weights are 1.0
+            "vote": "up" if is_reachable else "down",
+            "features": features
+        }
+        
+        # Add to binary vote tally
+        status = "up" if is_reachable else "down"
+        votes[status] += 1
 
+    # Step 2: Apply binary voting (Simple Majority)
+    if votes["up"] > votes["down"]:
+        consensus_verdict = "up"
+    elif votes["down"] > votes["up"]:
+        consensus_verdict = "down"
+    else:
+        # Tie-breaker: default to up
+        consensus_verdict = "up"
+
+    # Step 3: Prepare results
     results = {
         "epoch_id": epoch_id,
-        "majority_verdict": majority_verdict,
+        "consensus_verdict": consensus_verdict,
+        "binary_votes": {
+            "up": votes["up"],
+            "down": votes["down"]
+        },
         "total_reports": len(epoch_reports),
-        "votes_up": sum(votes),
-        "votes_down": len(votes) - sum(votes),
         "slashed": [],
         "honest": [],
         "node_reputations": {}
     }
 
-    for report in epoch_reports:
-        node_id = report.get("node_address", report.get("node_id", "unknown"))
-        node_vote = "up" if report.get("is_reachable", True) else "down"
+    # Log binary voting details
+    logger.info(f"Binary Voting Epoch {epoch_id}: UP={votes['up']}, DOWN={votes['down']} → {consensus_verdict.upper()}")
 
+    # Step 4: Update node reputations based on agreement with consensus
+    for node_id, data in node_data.items():
+        node_vote = data["vote"]
+        node_features = data.get("features", {})
+        
         if ml_consensus and ml_consensus.models_loaded:
-            # Use ML to calculate reputation based on report features
-            # Calculate advanced features that the model expects from monitoring data
-            # Adjust features to give higher scores for honest behavior
-            response_time = float(report.get("response_ms", report.get("response_time_ms", 0)))
-            is_reachable = report.get("is_reachable", True)
-            
-            features = {
-                # Map monitoring features to ML model features (11 features only)
-                "accuracy": 0.95 if is_reachable else 0.1,  # High accuracy for reachable sites
-                "false_positive_rate": 0.05 if is_reachable else 0.8,  # Low false positives for honest nodes
-                "false_negative_rate": 0.05 if is_reachable else 0.8,  # Low false negatives for honest nodes
-                "avg_rt_error": min(response_time / 1000.0, 0.5),  # Cap at 0.5 seconds, lower is better
-                "peer_agreement_rate": 0.9 if is_reachable else 0.3,  # High agreement for honest nodes
-                "report_consistency": 0.9 if is_reachable else 0.3,  # High consistency
-                "sudden_change_score": 0.1 if is_reachable else 0.7,  # Low sudden changes for honest nodes
-                "ssl_accuracy": 0.95 if report.get("ssl_valid", True) else 0.2,  # High SSL accuracy
-                "uptime_deviation": 0.1 if is_reachable else 0.5,  # Low uptime deviation
-                "rt_consistency": 0.9 if is_reachable else 0.3,  # High response time consistency
-                "itt_jitter": 0.1 if is_reachable else 0.4,  # Low jitter for consistent nodes
-            }
-            
             # Calculate ML-based reputation
-            ml_rep = ml_consensus.calculate_enhanced_reputation(features)
-            
-            # Debug log
-            logger.info(f"ML reputation for {node_id}: {safe_float(ml_rep):.4f} (features: {features})")
+            ml_rep = ml_consensus.calculate_enhanced_reputation(node_features, node_id=node_id)
             
             # Apply EWMA smoothing
             smoothed_rep = ml_consensus.apply_ewma_smoothing(node_id, ml_rep)
@@ -711,40 +731,27 @@ def run_consensus_vote(epoch_id: int, epoch_reports: list) -> dict:
             mitigation = ml_consensus.apply_mitigation_policy(smoothed_rep)
             ml_consensus.mitigation_actions[node_id] = mitigation
             
-            # Determine if slashed based on ML reputation threshold
-            if smoothed_rep < 0.4:
+            # Slash nodes that disagree with consensus
+            if node_vote != consensus_verdict:
                 results["slashed"].append(node_id)
                 logger.warning(
-                    f"ML SLASHED {node_id}: reputation {safe_float(smoothed_rep):.4f} < 0.4 | "
-                    f"status={mitigation.status} | shard={mitigation.shard}"
+                    f"SLASHED {node_id}: voted {node_vote} but consensus={consensus_verdict} "
+                    f"(P_malicious={p_malicious:.4f})"
                 )
             else:
                 results["honest"].append(node_id)
         else:
-            # Fallback to simple majority voting if ML not available
-            if node_vote != majority_verdict:
-                # Diverges from majority — slash reputation
-                if ml_consensus:
-                    current = ml_consensus.reputation.get(node_id, 0.90)
-                    ml_consensus.reputation[node_id] = max(0.0, current - 0.15)
-                    logger.warning(
-                        f"SLASHED {node_id}: voted {node_vote} but majority={majority_verdict} "
-                        f"reputation {safe_float(current):.2f} -> {safe_float(ml_consensus.reputation.get(node_id)):.2f}"
-                    )
+            # Fallback without ML
+            results["node_reputations"][node_id] = 1.0 - p_malicious
+            if node_vote != consensus_verdict:
                 results["slashed"].append(node_id)
-                results["node_reputations"][node_id] = ml_consensus.reputation.get(node_id, 0.5) if ml_consensus else 0.5
             else:
-                # Agrees with majority — small reputation boost
-                if ml_consensus:
-                    current = ml_consensus.reputation.get(node_id, 0.90)
-                    ml_consensus.reputation[node_id] = min(1.0, current + 0.01)
                 results["honest"].append(node_id)
-                results["node_reputations"][node_id] = ml_consensus.reputation.get(node_id, 0.5) if ml_consensus else 0.5
 
     logger.info(
-        f"Epoch {epoch_id} consensus: site={majority_verdict} | "
-        f"honest={results['honest']} | slashed={results['slashed']} | "
-        f"ML models loaded: {ml_consensus.models_loaded if ml_consensus else False}"
+        f"Epoch {epoch_id} consensus: verdict={consensus_verdict} | "
+        f"honest={len(results['honest'])} | slashed={len(results['slashed'])} | "
+        f"UP_votes={votes['up']} | DOWN_votes={votes['down']}"
     )
     return results
 
@@ -1542,8 +1549,11 @@ async def get_shard_consensus(shard_id: int):
             "confidence": 0.92,
             "timestamp": int(time.time()),
             "participating_nodes": 4,
-            "weighted_votes": 3.68,
-            "total_weight": 4.0
+            "binary_votes": {
+                "up": 3,
+                "down": 1
+            },
+            "total_votes": 4
         }
     }
 

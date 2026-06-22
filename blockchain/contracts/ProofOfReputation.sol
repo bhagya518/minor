@@ -106,8 +106,9 @@ contract ProofOfReputation {
         require(monitoringTrust <= 1000, "Monitoring trust must be <= 1000");
         require(mlScore <= 1000, "ML score must be <= 1000");
         
-        // Calculate PoR: PoR = 0.4 * monitoring_trust + 0.6 * ML_score
-        uint256 newReputation = (monitoringTrust * 40 + mlScore * 60) / 100;
+        // Calculate PoR: PoR = mlScore (representing 1 - Panomaly)
+        // Monitoring trust is stored but not used in the final reputation score
+        uint256 newReputation = mlScore;
         
         // Update node data
         nodes[nodeId].monitoringTrust = monitoringTrust;
@@ -130,7 +131,8 @@ contract ProofOfReputation {
             require(monitoringTrusts[i] <= 1000, "Monitoring trust must be <= 1000");
             require(mlScores[i] <= 1000, "ML score must be <= 1000");
 
-            uint256 newReputation = (monitoringTrusts[i] * 40 + mlScores[i] * 60) / 100;
+            // Calculate PoR: PoR = mlScore (representing 1 - Panomaly)
+            uint256 newReputation = mlScores[i];
 
             nodes[nodeIds[i]].monitoringTrust = monitoringTrusts[i];
             nodes[nodeIds[i]].mlScore = mlScores[i];

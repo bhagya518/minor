@@ -13,14 +13,12 @@ from sklearn.ensemble import RandomForestClassifier, IsolationForest, GradientBo
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import DBSCAN
-from sklearn.neighbors import LocalOutlierFactor
+from sklearn.neighbors import NearestNeighbors
 import joblib
 import os
 import logging
 from datetime import datetime
 import networkx as nx
-from scipy.spatial.distance import pdist, squareform
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -84,6 +82,103 @@ class EnsembleNodeClassifier:
         except Exception as e:
             logger.error(f"Error loading data: {e}")
             raise
+    
+    def _compute_graph_features_paper_compliant(self, X: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+        """
+        Compute paper-compliant graph features using Z-score formulas (Chapter 4.5).
+        
+        Formulas:
+        - InDeg_i = Σw_ji (weighted in-degree)
+        - OutDeg_i = Σw_ij (weighted out-degree)
+        - Degree_i = InDeg_i + OutDeg_i
+        - PR_i = (1-d)/N + d × Σ(PR_j / OutDeg_j)
+        - CC_i = 2T_i / (k_i × (k_i - 1))
+        - DegZ = |(Deg - μ) / σ|
+        - PRZ = |(PR - μ) / σ|
+        - CCZ = |(CC - μ) / σ|
+        - GraphScore = (PRZ + DegZ + CCZ) / 3
+        """
+        logger.info("Computing paper-compliant graph features...")
+        
+        n_nodes = len(X)
+        
+        # Build similarity-based adjacency matrix (weighted edges)
+        # Nodes with similar features are connected (w_ij)
+        from sklearn.neighbors import NearestNeighbors
+        n_neighbors = min(5, n_nodes - 1)
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(X)  # +1 to include self
+        distances, indices = nbrs.kneighbors(X)
+        
+        # Create weighted adjacency matrix
+        # Higher similarity = lower distance = higher weight
+        adjacency = np.zeros((n_nodes, n_nodes))
+        
+        for i in range(n_nodes):
+            for j_idx, j in enumerate(indices[i]):
+                if i != j:
+                    # Weight based on inverse distance (similarity)
+                    dist = distances[i][j_idx]
+                    weight = 1.0 / (1.0 + dist)
+                    adjacency[i, j] = weight
+        
+        # Calculate degree metrics (Chapter 4.4)
+        in_degree = np.sum(adjacency, axis=0)  # Σw_ji
+        out_degree = np.sum(adjacency, axis=1)  # Σw_ij
+        total_degree = in_degree + out_degree  # Degree_i
+        
+        # Calculate PageRank (Chapter 4.4)
+        damping_factor = 0.85
+        pagerank = np.ones(n_nodes) / n_nodes
+        
+        for _ in range(100):  # Iterate to convergence
+            new_pagerank = np.ones(n_nodes) * (1 - damping_factor) / n_nodes
+            for i in range(n_nodes):
+                for j in range(n_nodes):
+                    if out_degree[j] > 0:
+                        new_pagerank[i] += damping_factor * pagerank[j] * (adjacency[j, i] / out_degree[j])
+            pagerank = new_pagerank
+        
+        # Calculate Clustering Coefficient (Chapter 4.4)
+        clustering = np.zeros(n_nodes)
+        for i in range(n_nodes):
+            neighbors = np.where(adjacency[i] > 0)[0]
+            k_i = len(neighbors)
+            if k_i > 1:
+                # Count triangles
+                triangles = 0
+                for j_idx, j in enumerate(neighbors):
+                    for k_idx in range(j_idx + 1, len(neighbors)):
+                        k = neighbors[k_idx]
+                        if adjacency[j, k] > 0:
+                            triangles += 1
+                # CC_i = 2T_i / (k_i × (k_i - 1))
+                clustering[i] = (2 * triangles) / (k_i * (k_i - 1))
+        
+        # Calculate Z-scores (Chapter 4.5)
+        # DegZ = |(Deg - μ) / σ|
+        deg_mean, deg_std = np.mean(total_degree), np.std(total_degree) + 1e-9
+        deg_z = np.abs((total_degree - deg_mean) / deg_std)
+        
+        # PRZ = |(PR - μ) / σ|
+        pr_mean, pr_std = np.mean(pagerank), np.std(pagerank) + 1e-9
+        pr_z = np.abs((pagerank - pr_mean) / pr_std)
+        
+        # CCZ = |(CC - μ) / σ|
+        cc_mean, cc_std = np.mean(clustering), np.std(clustering) + 1e-9
+        cc_z = np.abs((clustering - cc_mean) / cc_std)
+        
+        # GraphScore = (PRZ + DegZ + CCZ) / 3 (Equation from Chapter 4.5)
+        graph_score = (pr_z + deg_z + cc_z) / 3.0
+        
+        logger.info("Paper-compliant graph features computed successfully")
+        
+        # Return Z-scores as graph features
+        return np.column_stack([
+            in_degree, out_degree, total_degree,  # Degree metrics
+            pagerank,                              # PageRank
+            clustering,                            # Clustering coefficient
+            deg_z, pr_z, cc_z, graph_score        # Z-scores
+        ])
     
     def engineer_graph_features(self, X, df):
         """
@@ -226,40 +321,42 @@ class EnsembleNodeClassifier:
         # Store training data for prediction
         self.graph_training_data = X_train
     
-    def get_model_predictions(self, X):
-        """Get predictions from all three models"""
+    def get_model_predictions(self, X, df=None):
+        """Get predictions from all three models (paper-compliant)"""
         predictions = {}
         
-        # Random Forest predictions (probability)
-        rf_proba = self.rf_model.predict_proba(X)[:, 1]  # Probability of malicious
+        # 1. Random Forest predictions (probability)
+        rf_proba = self.rf_model.predict_proba(X)[:, 1]
         predictions['rf'] = rf_proba
         
-        # Isolation Forest predictions (anomaly scores)
+        # 2. Isolation Forest predictions (anomaly scores)
         iso_scores = self.iso_model.decision_function(X)
         # Convert to probability (lower score = more anomalous)
-        iso_proba = 1 - (iso_scores - iso_scores.min()) / (iso_scores.max() - iso_scores.min())
+        iso_proba = 1 - (iso_scores - iso_scores.min()) / (iso_scores.max() - iso_scores.min() + 1e-9)
         predictions['iso'] = iso_proba
         
-        # Graph anomaly predictions (based on cluster membership)
-        # For new data, we need to predict using the trained model
-        try:
-            graph_labels = self.graph_model.fit_predict(X)
-            graph_proba = np.where(graph_labels == -1, 0.8, 0.2)  # High prob for noise points
-        except:
-            # If prediction fails, use default values
-            graph_proba = np.full(len(X), 0.2)  # Default to low probability
-        predictions['graph'] = graph_proba
+        # 3. Graph Anomaly predictions (Z-score based - Chapter 4.5)
+        if df is not None and 'graph_score' in df.columns:
+            # Use pre-calculated graph scores if available
+            predictions['graph'] = df['graph_score'].values
+        else:
+            # Calculate graph score on the fly (Chapter 4.5)
+            # DegZ = |(Deg - μ) / σ|, PRZ = |(PR - μ) / σ|, CCZ = |(CC - μ) / σ|
+            # GraphScore = (PRZ + DegZ + CCZ) / 3
+            graph_features = self._compute_graph_features_paper_compliant(X.values, pd.DataFrame())
+            graph_score = graph_features[:, -1] # Last column is the combined score
+            predictions['graph'] = graph_score
         
         return predictions
-    
-    def train_meta_learner(self, X_train, y_train):
-        """Train Gradient Boosting meta learner"""
-        logger.info("Training Gradient Boosting meta learner...")
+
+    def train_meta_learner(self, X_train, y_train, df_train=None):
+        """Train Gradient Boosting meta learner using RF, ISO, and GraphScore (Step 3)"""
+        logger.info("Training Gradient Boosting meta learner (paper-compliant)...")
         
         # Get predictions from base models
-        base_predictions = self.get_model_predictions(X_train)
+        base_predictions = self.get_model_predictions(X_train, df_train)
         
-        # Create meta features
+        # Create meta features: [RF_i, ISO_i, Graph_i] (as per Step 3)
         meta_features = np.column_stack([
             base_predictions['rf'],
             base_predictions['iso'], 
@@ -275,7 +372,7 @@ class EnsembleNodeClassifier:
         )
         
         self.meta_model.fit(meta_features, y_train)
-        logger.info("Meta learner trained successfully")
+        logger.info("Meta learner trained successfully (paper-compliant)")
     
     def evaluate_ensemble(self, X_test, y_test):
         """Evaluate the complete ensemble"""
@@ -391,10 +488,14 @@ class EnsembleNodeClassifier:
             # Load data
             X, y, df = self.load_data()
             
-            # CRITICAL FIX: Disable graph features to match ML consensus engine's 13 feature input
-            # Graph features require network topology which isn't available during inference
-            # Using only the 13 base features that the consensus engine provides
-            logger.info("Using base features only (13 features) to match consensus engine")
+            # CRITICAL FIX: Use paper-compliant Graph Anomaly Detection (Chapter 4.5)
+            # Graph features calculated from node relationships using Z-scores
+            logger.info("Computing paper-compliant graph features using Z-scores...")
+            
+            # Calculate graph metrics using Z-score formulas from paper
+            # This requires creating a graph from node features
+            graph_features = self._compute_graph_features_paper_compliant(X_train, df.iloc[:len(X_train)])
+            logger.info(f"Graph features shape: {graph_features.shape}")
             
             # Split data (use X directly, not X_enhanced with graph features)
             X_train, X_test, y_train, y_test = train_test_split(

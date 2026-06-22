@@ -165,29 +165,39 @@ class EnsembleDetector:
         return df_copy
     
     def _calculate_graph_anomaly_scores(self, df: pd.DataFrame) -> np.ndarray:
-        """Calculate anomaly scores based on graph metrics"""
-        logger.info("Calculating graph anomaly scores...")
+        """
+        Calculate graph anomaly scores using PAPER-COMPLIANT formulas (Chapter 4.5).
         
-        # Z-score based anomaly detection for graph metrics
-        pagerank_z = np.abs((df['pagerank'] - df['pagerank'].mean()) / 
-                           (df['pagerank'].std() + 1e-9))
+        Formulas:
+        - Degree Z-Score: DegZ = |(Deg - μ) / σ|
+        - PageRank Z-Score: PRZ = |(PR - μ) / σ|
+        - Clustering Z-Score: CCZ = |(CC - μ) / σ|
+        - Graph Score: GraphScore = (PRZ + DegZ + CCZ) / 3
+        """
+        logger.info("Calculating graph anomaly scores (paper-compliant)...")
         
+        # Calculate total degree (In-Degree + Out-Degree)
         total_degree = df['in_degree'] + df['out_degree']
+        
+        # Calculate Z-scores for each metric (Chapter 4.5)
+        # DegZ = |(Deg - μ) / σ|
         degree_z = np.abs((total_degree - total_degree.mean()) / 
                           (total_degree.std() + 1e-9))
         
+        # PRZ = |(PR - μ) / σ|
+        pagerank_z = np.abs((df['pagerank'] - df['pagerank'].mean()) / 
+                           (df['pagerank'].std() + 1e-9))
+        
+        # CCZ = |(CC - μ) / σ|
         clustering_z = np.abs((df['clustering'] - df['clustering'].mean()) / 
                              (df['clustering'].std() + 1e-9))
         
-        # Combine graph anomaly scores
+        # GraphScore = (PRZ + DegZ + CCZ) / 3  (Equation from Chapter 4.5)
         graph_score = (pagerank_z + degree_z + clustering_z) / 3.0
         
-        # Normalize to [0, 1]
-        graph_score_norm = (graph_score - graph_score.min()) / \
-                          (graph_score.max() - graph_score.min() + 1e-9)
-        
-        logger.info("Graph anomaly scores calculated")
-        return graph_score_norm
+        # Return raw Z-score (not normalized) as per paper
+        logger.info("Graph anomaly scores calculated (paper-compliant)")
+        return graph_score
     
     def fit(self, df: pd.DataFrame, node_col: str = 'node_id') -> Dict:
         """Train the ensemble detector"""

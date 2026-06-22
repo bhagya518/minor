@@ -23,16 +23,17 @@ def clamp(x: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
 class TrustEngine:
     """Engine for calculating and managing node trust scores"""
     
-    def __init__(self, window_size: int = 100, trust_decay_rate: float = 0.95):
+    def __init__(self, window_size: int = 100, ewma_alpha: float = 0.3):
         """
         Initialize trust engine
         
         Args:
             window_size: Number of recent reports to consider for trust calculation
-            trust_decay_rate: Rate at which trust scores decay over time (0-1)
+            ewma_alpha: EWMA smoothing factor (α) for reputation update
+                       Formula: Rep_new = α × Rep_old + (1-α) × Rep_current
         """
         self.window_size = window_size
-        self.trust_decay_rate = trust_decay_rate
+        self.ewma_alpha = ewma_alpha  # EWMA smoothing factor (default 0.3 as per paper)
         
         # Store node reports and trust data
         self.node_reports = defaultdict(lambda: deque(maxlen=window_size))
@@ -45,7 +46,7 @@ class TrustEngine:
         # Consistency tracking
         self.content_hashes = defaultdict(lambda: defaultdict(list))
         
-        logger.info(f"Trust engine initialized: window_size={window_size}, decay_rate={trust_decay_rate}")
+        logger.info(f"Trust engine initialized: window_size={window_size}, ewma_alpha={ewma_alpha}")
     
     def add_monitoring_report(self, node_id: str, report: Dict):
         """
@@ -140,18 +141,18 @@ class TrustEngine:
                 0.1 * peer_score
             )
             
-            # Apply time decay
-            last_update = self.node_last_update.get(node_id, datetime.now())
-            time_diff = (datetime.now() - last_update).total_seconds()
-            decay_factor = self.trust_decay_rate ** (time_diff / 3600)  # Decay per hour
+            # Apply EWMA update (Chapter 4.8)
+            # Formula: Rep_new = α × Rep_old + (1-α) × Rep_current
+            alpha = self.ewma_alpha
+            old_rep = self.node_trust_scores.get(node_id, 0.5)  # Default 0.5 for new nodes
+            new_rep = alpha * old_rep + (1 - alpha) * trust_score
             
-            final_score = trust_score * decay_factor
-            final_score = clamp(final_score)  # Clamp to [0,1]
+            final_score = clamp(new_rep)  # Clamp to [0,1]
             
             # Update stored trust score
             self.node_trust_scores[node_id] = final_score
             
-            logger.debug(f"Trust score for {node_id}: {final_score:.4f}")
+            logger.debug(f"Trust score for {node_id}: {final_score:.4f} (EWMA α={alpha})")
             return final_score
             
         except Exception as e:
@@ -477,9 +478,23 @@ class TrustCalculator:
     """Utility class for calculating Proof of Reputation scores"""
     
     @staticmethod
+    def calculate_reputation(p_malicious: float) -> float:
+        """
+        Calculate reputation score (Chapter 4.7)
+        Formula: Rep = 1 - P_malicious
+        
+        Args:
+            p_malicious: Probability of node being malicious (0-1)
+            
+        Returns:
+            Reputation score (0-1)
+        """
+        return max(0.0, min(1.0, 1.0 - p_malicious))
+    
+    @staticmethod
     def calculate_por_score(monitoring_trust: float, ml_score: float) -> float:
         """
-        Calculate Proof of Reputation score
+        Calculate Proof of Reputation score (alternative weighted formula)
         Formula: PoR = 0.6 * monitoring_trust + 0.4 * ml_score
         
         Args:

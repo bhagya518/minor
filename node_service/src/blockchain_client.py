@@ -945,13 +945,13 @@ class BlockchainClient:
         Calculate Proof of Reputation score
         
         Args:
-            monitoring_trust: Monitoring trust score (0-1)
-            ml_score: ML confidence score (0-1)
+            monitoring_trust: Monitoring trust score (0-1) - Ignored
+            ml_score: ML confidence score (0-1) - Used exclusively (1 - Panomaly)
             
         Returns:
             PoR score (0-1)
         """
-        return 0.6 * monitoring_trust + 0.4 * ml_score
+        return ml_score
     
     def health_check(self) -> Dict:
         """Check blockchain connection and contract availability"""

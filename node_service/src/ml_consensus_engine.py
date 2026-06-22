@@ -1109,20 +1109,29 @@ class EnhancedMLConsensusEngine:
         in_deg = dict(self.graph.in_degree(weight="weight"))
         out_deg = dict(self.graph.out_degree(weight="weight"))
         
+        # 3. Clustering Coefficient (Slide 11)
+        try:
+            clustering = nx.clustering(self.graph.to_undirected(), weight='weight')
+        except Exception as e:
+            logger.warning(f"Error calculating clustering: {e}")
+            clustering = {n: 0.0 for n in nodes_list}
+
         pr_vals = np.array([pagerank.get(node, 0.0) for node in nodes_list])
         deg_vals = np.array([in_deg.get(node, 0.0) + out_deg.get(node, 0.0) for node in nodes_list])
+        cc_vals = np.array([clustering.get(node, 0.0) for node in nodes_list])
         
         # Calculate means and std devs
-        pr_mean = np.mean(pr_vals)
-        pr_std = np.std(pr_vals)
-        deg_mean = np.mean(deg_vals)
-        deg_std = np.std(deg_vals)
+        pr_mean, pr_std = np.mean(pr_vals), np.std(pr_vals)
+        deg_mean, deg_std = np.mean(deg_vals), np.std(deg_vals)
+        cc_mean, cc_std = np.mean(cc_vals), np.std(cc_vals)
         
-        # Calculate one-sided Z-scores (only penalizing below mean)
-        pr_z = np.clip((pr_mean - pr_vals) / (pr_std + 1e-9), 0.0, None)
-        deg_z = np.clip((deg_mean - deg_vals) / (deg_std + 1e-9), 0.0, None)
+        # Calculate one-sided Z-scores (penalizing deviations from mean as per document)
+        pr_z = np.abs((pr_vals - pr_mean) / (pr_std + 1e-9))
+        deg_z = np.abs((deg_vals - deg_mean) / (deg_std + 1e-9))
+        cc_z = np.abs((cc_vals - cc_mean) / (cc_std + 1e-9))
         
-        graph_score_raw = (pr_z + deg_z) / 2.0
+        # GraphScore = (PRZ + DegZ + CCZ) / 3 (Equation from Step 3)
+        graph_score_raw = (pr_z + deg_z + cc_z) / 3.0
         
         raw_min = graph_score_raw.min()
         raw_max = graph_score_raw.max()
@@ -1173,31 +1182,6 @@ class MLConsensusEngine(EnhancedMLConsensusEngine):
         malicious = [1.0 - r for r in reputations]
         return pd.DataFrame({"p_malicious": malicious})
 
-    pass
-    """Legacy alias to load enhanced models."""
-        self.load_enhanced_models()
-
-    def predict_malicious_probability(self, features_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Legacy wrapper for prediction.
-
-        Takes a DataFrame where each row is a feature set, computes the enhanced
-        reputation (probability of *honest*) via `calculate_enhanced_reputation`,
-        then returns a DataFrame with a single column `p_malicious` representing
-        the probability of being malicious (i.e. 1 - reputation).
-        """
-        if features_df.empty:
-            return pd.DataFrame(columns=["p_malicious"])
-        # Compute reputation for each row
-        reputations = [
-            self.calculate_enhanced_reputation(row.to_dict())
-            for _, row in features_df.iterrows()
-        ]
-        # Convert to malicious probability
-        malicious = [1.0 - r for r in reputations]
-        return pd.DataFrame({"p_malicious": malicious})
-
-    pass
-urn pd.DataFrame({"p_malicious": malicious})
-
+class MLConsensusEngine(EnhancedMLConsensusEngine):
+    """Compatibility wrapper for legacy imports."""
     pass

@@ -23,7 +23,7 @@ SHARD_PALETTE = [
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-def _get(url, timeout=5):
+def _get(url, timeout=15):
     try:
         r = requests.get(url, timeout=timeout)
         return r.json() if r.status_code == 200 else {"error": f"HTTP {r.status_code}"}
@@ -45,7 +45,7 @@ def discover_nodes(seed_node=SEED_NODE):
         url = queue.pop().replace("localhost", "127.0.0.1")
         if url in discovered:
             continue
-        peers_data = _get(f"{url}/peers", timeout=5)
+        peers_data = _get(f"{url}/peers", timeout=15)
         if peers_data and "error" not in peers_data:
             peers = peers_data.get("peers") or peers_data.get("peer_list")
             if isinstance(peers, dict):
